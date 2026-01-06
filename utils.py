@@ -204,3 +204,88 @@ def get_siegle_steps(dandi_filepath, unit_name, orientation):
         largest_cluster[pos_x, pos_y] = response_grid_filtered[pos_x, pos_y]
 
     return R, O, response_grid_filtered, largest_cluster, center_of_mass
+
+
+
+def PlotTuningCurve_Marcel(rfs, idx, visual_coverage, sigmas, screen_ratio, show=True, canvas=None):
+    """
+    Quick and drity fix of Waven.Analysis_Utils.PlotTuningCurve
+    """
+
+    xM, xm, yM, ym = visual_coverage
+    cc_f_1_xy=rfs[0][idx, :, :, np.array(rfs[1])[2, idx], np.array(rfs[1])[3, idx]]
+    cc_f_1_o=rfs[0][idx,np.array(rfs[1])[0, idx], np.array(rfs[1])[1, idx], :, :]
+    s=np.array(rfs[1])[3, idx]
+    o = np.array(rfs[1])[2, idx]
+
+    u, s__, v = svds(cc_f_1_xy, 2)
+    ori_tun = np.append(cc_f_1_o[:, s], cc_f_1_o[0, s])
+    i = 1
+    if v[1][np.argmax(abs(v[1]))] < 0:
+        i = -1
+    if show:
+        if canvas is None:
+            fig, ax = plt.subplots(1, 5, figsize=(15, 1.5))
+        else:
+            fig = canvas[0]
+            ax = canvas[1]
+
+        m=ax[0].imshow(cc_f_1_xy.T, cmap='coolwarm', vmin=-abs(cc_f_1_xy).max(), vmax=abs(cc_f_1_xy).max())
+        fig.colorbar(m)
+        ax[0].set_xticks([0 , cc_f_1_xy.shape[0]], [xM, xm])
+        ax[0].set_yticks([0, cc_f_1_xy.shape[1]], [yM, ym])
+        ax[0].set_title('2D correlation')
+        
+        ax[1].plot(i*v[1][::-1], c='k')
+        ax[1].set_xticks([0, cc_f_1_xy.shape[1]], [ym, yM])
+        ax[1].set_ylabel('Corr.')
+        ax[1].set_xlabel('Elevation (deg)')
+
+
+        ax[2].plot(i*u[:, 1], c='k')
+        ax[2].set_xticks([0, cc_f_1_xy.shape[0]], [xM, xm])
+        ax[2].set_xlabel('Azimuth (deg)')
+        # ax[1].plot(np.max(cc_f_1_xy, axis=0))
+        # ax[2].plot(np.max(cc_f_1_xy, axis=1))
+        # ax[1].plot(cc_f_1_xy[x, :])
+        mm = max(cc_f_1_o.min(), cc_f_1_o.max(), key=abs)
+
+        ax[3].plot(ori_tun, 'o-', c='k')
+        ax[3].set_xticks([0, 4, 8], [0,90, 180])
+        ax[3].set_xlabel('Orientation (deg)')
+
+        # ax[3].set_ylim(bottom=0)
+        # if mm<=0:
+        #     ax[1].set_ylim(mm, 0)
+        # else:
+        #     ax[1].set_ylim(0, mm)
+        # ax[2].plot(abs(cc_f_1[:, s, f]))
+        ax[4].plot(cc_f_1_o[o, :], 'o-', c='k')
+        ax[4].set_xticks(np.arange(len(sigmas)), sigmas)
+        ax[4].set_xlabel('Size (deg)')
+
+        # fig.tight_layout()
+        # plt.show()
+    return [cc_f_1_xy.T, i*v[1][::-1], i*u[:, 1], ori_tun, cc_f_1_o[o, :]]
+
+
+def load_all_gabor_rf_results():
+    RESULTS_DIR = '../../results/allen_open_scope/rf/siegle/gabors/z-score_responses/new'
+    results_files = [os.path.join(RESULTS_DIR, f) for f in os.listdir(RESULTS_DIR) if f.endswith('.h5')]
+    results = []
+    for file in results_files:
+        with h5py.File(file, 'r') as hf:
+            for unit in hf.keys():
+                grp = hf[unit]
+                results.append({
+                    'unit_name': unit,
+                    'file': grp['file'][()].decode('utf-8'),
+                    'orientation': grp['orientation'][()],
+                    'mean_response': grp['mean_response'][()],
+                    'z_score_response': grp['z_score_response'][()],
+                    'p_value': grp['p_value'][()],
+                    'probe': grp['probe'][()].decode('utf-8'),
+                    'mean_rate': grp['mean_rate'][()]
+                })
+
+    return pd.DataFrame(results)
