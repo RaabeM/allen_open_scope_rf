@@ -49,19 +49,7 @@ python compute_waven_pipeline.py ProbeB \***
 
 Results are saved to `<results-dir>/<probe>/lib_<hash>/` as one `.h5` file per (delay, duration) combination.
 
-**Caution:** Under the current settings loading the filter libraries take **256 GB of RAM!**
-
-### Optimize parameters
-
-After running the pipeline across the full delay × duration grid:
-
-```bash
-python optimize_waven_parameters.py /results/waven/ProbeB/lib_<hash>/ \
-    --output /results/waven/ProbeB/lib_<hash>/best_params.h5
-```
-
-
-## Output format
+#### Output format
 
 Each result file is an HDF5 with the following structure:
 
@@ -74,7 +62,34 @@ Each result file is an HDF5 with the following structure:
 /abs_max_value           — (n_units,)
 ```
 
+**Caution:** Under the current settings loading the filter libraries takes **256 GB of RAM!**
 
-## Dependencies
+### Optimize parameters
 
-See `envs/waven_dandi.yml`. Key packages: PyTorch, PyNWB, DANDI, NumPy, SciPy, Numba, Elephant/Neo, h5py.
+After running the pipeline across the full delay × duration grid:
+
+```bash
+python optimize_waven_parameters.py /results/waven/ProbeB/lib_<hash>/ \
+    --output /results/waven/ProbeB/lib_<hash>/best_params.h5
+```
+
+#### Output format
+
+```
+/unit_ids      — (n_units,) unit identifier strings
+/rf_maps       — (n_units, nx, ny)  float32  gzip-4  spatial RF map at best params
+/delay         — (n_units,)  optimal delay in seconds
+/duration      — (n_units,)  optimal duration in seconds
+/abs_max_value — (n_units,)  peak |Pearson r| across all (delay, duration, θ, σ, f)
+/x_deg         — (n_units,)  RF centre azimuth in visual degrees
+/y_deg         — (n_units,)  RF centre elevation in visual degrees
+/theta_deg     — (n_units,)  orientation in Waven's degree convention
+/theta_rad     — (n_units,)  orientation in radians
+/sigma_deg     — (n_units,)  Gabor σ in visual degrees
+/sigma         — (n_units,)  Gabor σ in pixels
+/frequency     — (n_units,)  spatial frequency in cycles/pixel
+/xi, /yi       — (n_units,)  grid indices of RF centre
+/theta_idx, /sigma_idx, /frequency_idx  — (n_units,)  grid indices of best params
+/lib_id        — (n_units,)  filter library hash string
+/source_file   — (n_units,)  path to the per-(delay, duration) source .h5
+```
