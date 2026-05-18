@@ -43,6 +43,7 @@ import json
 import hashlib
 import numpy as np
 from typing import Dict, Any, Tuple
+import time
 
 
 
@@ -160,7 +161,7 @@ def downsample_video():
                                 )
 
 
-def wavelet_decomposition(library_path=library_path, movpath=movpath):
+def get_path_wavelet_decomposition(library_path=library_path, movpath=movpath):
     # Video decomposition
     lib_name = os.path.basename(library_path)
     lib_id = lib_name.split('_')[-1].split('.')[0]
@@ -196,106 +197,55 @@ def make_typed_spike_list(spike_times_obj_array):
     return tl
 
 
-@njit
 def compute_neuron_rate_to_zebra_frames(frame_onset_times, spike_times_list, delay=0.0, duration=1/30):
+    """
+    Compute the firing rate of each neuron in spike_times_list for each frame defined by frame_onset_times, given a delay and duration.
+    Assumes that spike times are sorted. 
+    """
+    starts = frame_onset_times + delay      # vectorized, shape (num_trials,)
+    stops  = starts + duration
     num_units = len(spike_times_list)
-    num_trials = len(frame_onset_times)
-    out = np.zeros((num_units, num_trials), dtype=np.float64)
-    # out = np.zeros((num_trials, num_units), dtype=np.float64)
-
+    out = np.zeros((num_units, len(frame_onset_times)), dtype=np.float64)
 
     for u in range(num_units):
-        unit_spike_times = spike_times_list[u]
-        for i in range(num_trials):
-            start_time = frame_onset_times[i] + delay
-            # stop_time  = frame_offset_times[i] + delay
-            stop_time  = start_time + duration
-            rate = np.sum((unit_spike_times >= start_time) & (unit_spike_times < stop_time)) / (stop_time - start_time)
-            out[u, i] = rate
-
+        spk = spike_times_list[u]
+        out[u] = (np.searchsorted(spk, stops) - np.searchsorted(spk, starts)) / duration
     return out
 
 
-
-def save_results(rfs_zebra, unit_names_list, delay, filename, results_dir='../../results/allen_open_scope/rf/waven/zebra/'):
-    # Save results
-    
-    outpath = os.path.join(results_dir, filename)
-    if os.path.exists(outpath):
-        os.remove(outpath)
-
-
-    with h5py.File(outpath, 'a') as hf:
-        # create or replace a group for this unit
-        for idx, unit_name in enumerate(unit_names_list):
-            
-            grp_name = unit_name
-            if grp_name in hf:
-                del hf[grp_name]
-            grp = hf.create_group(grp_name)
-
-            grp.create_dataset('delay', data=delay)
-
-            opt_sigma_idx = np.array(rfs_zebra[1])[3, idx]
-            grp.create_dataset('opt_sigma', data=sigmas[opt_sigma_idx])
-
-            theta_idx = 0
-            cc_f_1_xy=rfs_zebra[0][idx, :, :, theta_idx, opt_sigma_idx]
-            grp.create_dataset('response_theta_0', data=cc_f_1_xy)
-
-            theta_idx = 1
-            cc_f_1_xy=rfs_zebra[0][idx, :, :, theta_idx, opt_sigma_idx]
-            grp.create_dataset('response_theta_45', data=cc_f_1_xy)
-
-            theta_idx = 2
-            cc_f_1_xy=rfs_zebra[0][idx, :, :, theta_idx, opt_sigma_idx]
-            grp.create_dataset('response_theta_90', data=cc_f_1_xy)
+# @njit
+# def compute_neuron_rate_to_zebra_frames(frame_onset_times, spike_times_list, delay=0.0, duration=1/30):
+#     num_units = len(spike_times_list)
+#     num_trials = len(frame_onset_times)
+#     out = np.zeros((num_units, num_trials), dtype=np.float64)
+#     # out = np.zeros((num_trials, num_units), dtype=np.float64)
 
 
-def read_results(filename,results_dir):
+#     for u in range(num_units):
+#         unit_spike_times = spike_times_list[u]
+#         for i in range(num_trials):
+#             start_time = frame_onset_times[i] + delay
+#             # stop_time  = frame_offset_times[i] + delay
+#             stop_time  = start_time + duration
+#             rate = np.sum((unit_spike_times >= start_time) & (unit_spike_times < stop_time)) / (stop_time - start_time)
+#             out[u, i] = rate
 
-    outpath = os.path.join(results_dir, filename)
-    with h5py.File(outpath, 'r') as file:
-        unit_names_saved = list(file.keys())
-        opt_sigmas = []
-        response_theta_0s = []
-        response_theta_45s = []
-        response_theta_90s = []
-
-        for unit_name in unit_names_saved:
-            grp = file[unit_name]
-            opt_simga = grp['opt_sigma'][()]
-            delay = grp['delay'][()]
-            response_theta_0 = grp['response_theta_0'][:]
-            response_theta_45 = grp['response_theta_45'][:]
-            response_theta_90 = grp['response_theta_90'][:]
-
-            
-            opt_sigmas.append( opt_simga )
-            response_theta_0s.append(response_theta_0)
-            response_theta_45s.append(response_theta_45)
-            response_theta_90s.append(response_theta_90)
+#     return out
 
 
+def save_results(rfs,
+                     unit_names_list,
+                     delay,
+                     duration,
+                     sigmas,
+                     thetas,
+                     frequencies,
+                     results_path='./',
+                     results_filename='',
+                     attributes: Dict[str, Any] = {}
+                     ):
+    import tempfile
 
-    df_res_waven = pd.DataFrame({'unit_name':unit_names_saved, 
-                                'opt_simgas':opt_sigmas, 
-                                'response_theta_0':response_theta_0s,
-                                'response_theta_45':response_theta_45s,
-                                'response_theta_90':response_theta_90s,
-                                'delay':delay,
-                                })
-
-    df_res_waven['max_response_0'] = df_res_waven['response_theta_0'].apply(lambda x: np.max(x))
-    df_res_waven['max_response_45'] = df_res_waven['response_theta_45'].apply(lambda x: np.max(x))
-    df_res_waven['max_response_90'] = df_res_waven['response_theta_90'].apply(lambda x: np.max(x))
-    df_res_waven['overall_max'] = df_res_waven[['max_response_0', 'max_response_45', 'max_response_90',]].abs().max(axis=1)
-
-    return df_res_waven
-
-
-def save_results_new(rfs, unit_names_list, delay, duration, sigmas, thetas, frequencies,
-                     results_path='./', results_filename=''):
     results_path = Path(results_path)
     results_path.mkdir(parents=True, exist_ok=True)
 
@@ -303,19 +253,37 @@ def save_results_new(rfs, unit_names_list, delay, duration, sigmas, thetas, freq
         results_filename += '.h5'
 
     outpath = results_path / results_filename
-    if outpath.exists():
-        outpath.unlink()
 
-    with h5py.File(outpath, 'w') as hf:
-        for name, val in (('sigmas', sigmas), ('thetas', thetas), ('frequencies', frequencies),
-                          ('delay', delay), ('duration', duration)):
-            hf.attrs[name] = val
+    # Write to a temp file first; rename atomically on success so that any
+    # interruption (OOM kill, wall-time exceeded) never leaves a corrupt file.
+    tmp_fd, tmp_name = tempfile.mkstemp(suffix='.h5', dir=results_path)
+    os.close(tmp_fd)
+    tmp_path = Path(tmp_name)
 
-        hf.create_dataset('unit_ids', data=list(unit_names_list))
-        hf.create_dataset('correlation_matrix', data=rfs[0], compression='gzip', compression_opts=4)
-        hf.create_dataset('best_gabor_params_idx', data=rfs[1])
-        hf.create_dataset('best_gabor_params_degree', data=rfs[2])
-        hf.create_dataset('abs_max_value', data=rfs[3])
+    try:
+        with h5py.File(tmp_path, 'w') as hf:
+            for name, val in (('sigmas', sigmas),
+                              ('thetas', thetas),
+                              ('frequencies', frequencies),
+                              ('delay', delay),
+                              ('duration', duration)):
+                hf.attrs[name] = val
+
+            for k, v in attributes.items():
+                hf.attrs[k] = v
+
+            hf.create_dataset('unit_ids', data=list(unit_names_list))
+            hf.create_dataset('correlation_matrix', data=rfs[0], compression='gzip', compression_opts=4)
+            hf.create_dataset('best_gabor_params_idx', data=rfs[1])
+            hf.create_dataset('best_gabor_params_degree', data=rfs[2])
+            hf.create_dataset('abs_max_value', data=rfs[3])
+
+        if outpath.exists():
+            outpath.unlink()
+        tmp_path.rename(outpath)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
     return outpath
 
@@ -330,205 +298,29 @@ def subsample_wavelet_responses(wavelets_complex, xis, yis):
     return wavelets_complex_subsampled
 
 
-def convolve_gabor_library_with_video(library_np, video_np, device='cuda'):
-    """
-    library_np: np.ndarray shaped (Nx, Ny, Ntheta, Nsigma, Nfrequency, Noffset, K)
-                where K == Nx*Ny and last axis is flattened kernel for each output pixel.
-    video_np:   np.ndarray shaped (Nframes, Nx, Ny)
-    returns:    torch.Tensor shaped (Nframes, Nx, Ny, Ntheta, Nsigma, Nfrequency, Noffset)
-    """
-    # convert & check
-    lib = torch.as_tensor(library_np, dtype=torch.float32, device=device)
-    vid = torch.as_tensor(video_np, dtype=torch.float32, device=device)
+def load_phase_dependent_wavelet_decompositions(path_decompositions, xis=[], yis=[]):
 
-    Nframes = vid.shape[0]
-    K = lib.shape[-1]
-    assert vid.shape[1] * vid.shape[2] == K, "Nx*Ny must equal library last dim"
+    pc0 = os.path.join(path_decompositions, 'dwt_videodata_0.npy')
+    pc1 = os.path.join(path_decompositions, 'dwt_videodata_1.npy')
 
-    # flatten frames: (Nframes, K)
-    frames = vid.reshape(Nframes, -1)
+    if not os.path.exists(pc0) or not os.path.exists(pc1):
+        raise FileNotFoundError(f"Wavelet decomposition files not found at {pc0} and/or {pc1}. Please run wavelet_decomposition() first.")
 
-    # compute dot product contracting the last axis of lib with frames
-    # einsum indices: 'fk,xyabcdk->fxyabcd'
-    out = torch.einsum('fk,xyabcdk->fxyabcd', frames, lib)
-    # out shape: (Nframes, Nx, Ny, Ntheta, Nsigma, Nfrequency, Noffset)
-    return out
+    wavelet_0 = np.load(pc0)
+    wavelet_1 = np.load(pc1)
+
+    if len(xis) > 0 and len(yis) > 0:
+        wavelet_0 = subsample_wavelet_responses(wavelet_0, xis, yis)
+        wavelet_1 = subsample_wavelet_responses(wavelet_1, xis, yis)
+
+    # stack phase 0 and 1 into a new phase dimension: result shape will be
+    # (n_frames, n_phases=2, Nx, Ny, Ntheta, Nsigma, Nfreq, Noffset, ...)
+    combined = np.stack((wavelet_0, wavelet_1), axis=-1)
+
+    return combined
 
 
-
-def convolve_library_inmemory(library_np, video_np, device='cuda', block_pixels=256, dtype=np.float32):
-    """
-    Compute convolution in GPU in blocks, keep each computed block in RAM and
-    append; return full array of shape (Nframes, Nx, Ny, Ntheta, Nsigma, Nfreq, Noffset).
-    WARNING: final result is kept in memory.
-    """
-    Nx, Ny, Ntheta, Nsigma, Nfreq, Noffset, K = library_np.shape
-    Nframes = video_np.shape[0]
-    assert K == Nx * Ny
-    n_filters_per_pixel = Ntheta * Nsigma * Nfreq * Noffset
-
-    # flatten frames once (Nframes, K) and move to device
-    frames = video_np.reshape(Nframes, K).astype(dtype)
-    dev = torch.device(device)
-    frames_t = torch.as_tensor(frames, dtype=torch.float32, device=dev)
-
-    # prepare pixel index order and accumulator
-    indices = [(i, j) for i in range(Nx) for j in range(Ny)]
-    chunks = []  # list of numpy arrays shaped (Nframes, bs, Ntheta, Nsigma, Nfreq, Noffset)
-
-    for start in range(0, len(indices), block_pixels):
-        block = indices[start:start + block_pixels]
-        bs = len(block)
-
-        # build filters matrix (K, bs * n_filters_per_pixel)
-        filters_block = np.empty((K, bs * n_filters_per_pixel), dtype=dtype)
-        for bi, (ix, iy) in enumerate(block):
-            fvals = library_np[ix, iy, :, :, :, :, :]                  # (Ntheta,Nsigma,Nfreq,Noffset,K)
-            fvals_rs = fvals.reshape(n_filters_per_pixel, K)           # (n_filters_per_pixel, K)
-            filters_block[:, bi*n_filters_per_pixel:(bi+1)*n_filters_per_pixel] = fvals_rs.T
-
-        # GPU matmul: (Nframes, K) @ (K, M) -> (Nframes, M)
-        filters_t = torch.as_tensor(filters_block, dtype=torch.float32, device=dev)
-        out_block = torch.matmul(frames_t, filters_t)  # (Nframes, bs * n_filters_per_pixel)
-        out_block = out_block.cpu().numpy().astype(dtype)
-
-        # reshape to (Nframes, bs, Ntheta, Nsigma, Nfreq, Noffset) and append to list
-        out_block = out_block.reshape(Nframes, bs, Ntheta, Nsigma, Nfreq, Noffset)
-        chunks.append(out_block)
-
-        # cleanup GPU temporaries
-        del filters_t, out_block
-        torch.cuda.empty_cache()
-
-    # concatenate all pixel blocks along pixel axis -> (Nframes, Nx*Ny, Ntheta,...)
-    concatenated = np.concatenate(chunks, axis=1)  # axis=1 is pixel axis
-    # reshape to final shape
-    final = concatenated.reshape(Nframes, Nx, Ny, Ntheta, Nsigma, Nfreq, Noffset)
-    return final
-
-import h5py
-from typing import Optional
-
-def convolve_per_frame_wholeframe(library_np: np.ndarray,
-                                  video_np: np.ndarray,
-                                  out_path: Optional[str] = None,
-                                  device: str = 'cuda',
-                                  block_pixels: int = 128,
-                                  dtype=np.float32,
-                                  to_hdf5: bool = True):
-    """
-    For each frame: move the whole flattened frame to device once, then iterate
-    over small blocks of output pixels and matmul frame @ filters_block.
-
-    library_np: shape (Nx, Ny, Ntheta, Nsigma, Nfreq, Noffset, K) with K == Nx*Ny
-    video_np:   shape (Nframes, Nx, Ny)
-    out_path:   HDF5 filename if to_hdf5 True
-    block_pixels: number of output pixels per block
-    """
-    Nx, Ny, Ntheta, Nsigma, Nfreq, Noffset, K = library_np.shape
-    Nframes = video_np.shape[0]
-    assert K == Nx * Ny
-    n_filters = Ntheta * Nsigma * Nfreq * Noffset
-    dev = torch.device(device)
-
-    # prepare pixel index blocks
-    indices = [(ix, iy) for ix in range(Nx) for iy in range(Ny)]
-    blocks = [indices[s:s+block_pixels] for s in range(0, len(indices), block_pixels)]
-
-    # prepare output store
-    out_shape = (Nframes, Nx, Ny, Ntheta, Nsigma, Nfreq, Noffset)
-    if to_hdf5:
-        if out_path is None:
-            raise ValueError("out_path must be provided when to_hdf5=True")
-        h5f = h5py.File(out_path, 'w')
-        dset = h5f.create_dataset('out', shape=out_shape, dtype='f4',
-                                  chunks=(1, min(Nx,16), min(Ny,16), Ntheta, Nsigma, Nfreq, Noffset),
-                                  compression="gzip")
-    else:
-        out_frames = []
-
-    for fi in range(Nframes):
-        # move full flattened frame to device once
-        frame = video_np[fi].reshape(K).astype(dtype)               # (K,)
-        frame_t = torch.as_tensor(frame, dtype=torch.float32, device=dev)  # (K,)
-
-        # buffer for this frame's pixel outputs (flat pixel axis)
-        frame_pixels_out = np.empty((len(indices), n_filters), dtype=dtype)
-        pos = 0
-
-        for block in blocks:
-            bs = len(block)
-            # build filter block on CPU: shape (K, bs * n_filters)
-            fb = np.empty((K, bs * n_filters), dtype=dtype)
-            for bi, (ix, iy) in enumerate(block):
-                fvals = library_np[ix, iy, :, :, :, :, :]     # (Ntheta,Nsigma,Nfreq,Noffset,K)
-                fvals_rs = fvals.reshape(n_filters, K)        # (n_filters, K)
-                fb[:, bi*n_filters:(bi+1)*n_filters] = fvals_rs.T  # (K, n_filters) per pixel
-
-            # move filters block to device and matmul with the full frame
-            filters_t = torch.as_tensor(fb, dtype=torch.float32, device=dev)   # (K, M)
-            out_block = torch.matmul(frame_t.unsqueeze(0), filters_t)          # (1, M)
-            out_block = out_block.squeeze(0).cpu().numpy().astype(dtype)       # (M,)
-            out_block = out_block.reshape(bs, n_filters)                       # (bs, n_filters)
-
-            frame_pixels_out[pos:pos+bs, :] = out_block
-            pos += bs
-
-            # free GPU mem for this block
-            del filters_t, out_block, fb
-            torch.cuda.empty_cache()
-
-        # reshape flat pixel axis to (Nx, Ny, Ntheta, ...)
-        frame_full = frame_pixels_out.reshape(Nx, Ny, Ntheta, Nsigma, Nfreq, Noffset)
-
-        if to_hdf5:
-            dset[fi, :, :, :, :, :, :] = frame_full
-        else:
-            out_frames.append(frame_full)
-
-        # free per-frame GPU memory
-        del frame_t
-        torch.cuda.empty_cache()
-
-    if to_hdf5:
-        h5f.close()
-        return out_path
-    else:
-        return np.stack(out_frames, axis=0)
-
-
-def wavelet_decomposition_gpu(library_path=library_path, movpath=movpath, device='cuda'):
-
-    lib_name = os.path.basename(library_path)
-    lib_id = lib_name.split('_')[-1].split('.')[0]
-
-    movpath = Path(movpath)
-    path_decompositions = movpath.parent / 'wavelet_decompositions' / f'lib-{lib_id}'
-    Path(path_decompositions).mkdir(exist_ok=True)
-
-    # Load downsampled video
-    video_path = f'{movpath.parent/movpath.stem}_downsampled__{ny}_{nx}.npy'
-    if not os.path.exists(video_path):
-        print(f"Downsampled video not found at {video_path}. Running downsampling...")
-        downsample_video()
-    videodata=np.load(video_path)
-
-    # Load filter library
-    filter_library = np.load(library_path)
-
-    # Make the composition
-    wavelet_decomposition = convolve_per_frame_wholeframe(filter_library, videodata, device=device, to_hdf5=False)
-    print(wavelet_decomposition.shape)
-
-    for phase in [0, 1]:
-        filename = f'dwt_videodata_{phase}.npy'
-        file_path = os.path.join(path_decompositions, filename)
-        np.save(file_path, wavelet_decomposition[..., phase])
-
-    return path_decompositions
-
-
-def load_wavelet_decomposition(path_decompositions, xis=[], yis=[]):
+def load_complex_wavelet_decomposition(path_decompositions, xis=[], yis=[]):
 
     pc = os.path.join(path_decompositions, 'dwt_videodata_c.npy')
     if not os.path.exists(pc):
@@ -578,24 +370,33 @@ def load_wavelet_decomposition(path_decompositions, xis=[], yis=[]):
     if len(xis) > 0 and len(yis) > 0:
         wavelet_c = subsample_wavelet_responses(wavelet_c, xis, yis)
 
+    # add a new axis for phase to match expected shape (n_frames, Nx, Ny, Ntheta, Nsigma, Nfreq, Noffset, n_phases) in au.PearsonCorrelationPinkNoise()
+    wavelet_c = wavelet_c[..., np.newaxis]  
+
     return wavelet_c
-                                                            
+
 
 def full_pipeline(frame_onset_times,
                 #   frame_offset_times,
                   spike_times_list,
-                  delay,
-                  duration,
+                  delays,
+                  durations,
                   unit_names_list,
                   xis=[],
                   yis=[],
                   results_path='./',
-                  results_filename=''):
+                  results_filename='',
+                  attributes={}, 
+                  recompute=False, 
+                  phase_dependency=True,
+                  ):
 
-    print(f'Running Waven Pipeline for delay={delay} seconds und duration={duration} seconds...')
+    # ensure delays and durations are numpy 1D arrays of floats (support scalar input)
+    delays = np.atleast_1d(np.asarray(delays, dtype=float))
+    durations = np.atleast_1d(np.asarray(durations, dtype=float))
 
-    print('Creating Gabor Library...')
     # create_gabor_library()
+    print('Creating/Loading Gabor Filter Library...')
     library_path = create_gabor_library(xs, ys, thetas, sigmas, offsets, frequencies)
     lib_id = os.path.basename(library_path).split('_')[-1].split('.')[0]
 
@@ -603,63 +404,73 @@ def full_pipeline(frame_onset_times,
     downsample_video()
 
     print('Wavelet Decomposition...')
-    path_decompositions =  wavelet_decomposition(library_path=library_path)
+    path_decompositions =  get_path_wavelet_decomposition(library_path=library_path)
     # path_decompositions =  wavelet_decomposition_gpu(library_path=library_path, device='cuda')
 
-
-
-
-    print('Computing Neuron Rates to Zebra Frames...')
-    spike_times_list = make_typed_spike_list(spike_times_list)
-    neuron_rate_to_zebra_frames = compute_neuron_rate_to_zebra_frames(frame_onset_times, spike_times_list, delay, duration)
-    # neuron_rate_to_zebra_frames = neuron_rate_to_zebra_frames[:10, :]
-    print(neuron_rate_to_zebra_frames.shape)
-
-    ## the spikes data have to be time registered to the stimulus frames
-    ## MR Only one trial thus no repeatability
-    # respcorr_zebra = au.repetability_trial3(spks, neuron_pos, plotting=True)
-    # wavelets0, wavelets1, wavelet_c = lpn.coarseWavelet(path=path_decompositions,
-    #                                                     downsampling=False, 
-    #                                                     nx0=nx, 
-    #                                                     ny0=ny, 
-    #                                                     nx=nx, 
-    #                                                     ny=ny, 
-    #                                                     no=n_thetas, 
-    #                                                     ns=ns,
-    #                                                     nf=len(frequencies),
-    #                                                     chunk_size=1000)
     print('Loading and Subsampling Wavelet Decompositions...')
-    wavelet_c = load_wavelet_decomposition(path_decompositions, xis, yis)
-    
+    if phase_dependency:
+        wavelet_decomposition = load_phase_dependent_wavelet_decompositions(path_decompositions, xis, yis)
+    else:
+        wavelet_decomposition = load_complex_wavelet_decomposition(path_decompositions, xis, yis)
 
-    print('Running Correlation Analysis...')
-    ## runs correlation analysis
-    rfs = au.PearsonCorrelationPinkNoise(stim=wavelet_c.reshape(wavelet_c.shape[0], -1), 
-                                            resp=neuron_rate_to_zebra_frames.T,
-                                            neuron_pos=np.zeros((1,2)),  # dummy value for neuron_pos, 
-                                            nx=wavelet_c.shape[1], 
-                                            ny=wavelet_c.shape[2], 
-                                            ns=ns, 
-                                            n_frequencies=len(frequencies),
-                                            visual_coverage=analysis_coverage, 
-                                            screen_ratio=screen_ratio, 
-                                            sigmas=sigmas_deg,
-                                            plotting=False,
-                                            n_thetas=n_thetas
-                                            )
+    results_path = Path(results_path) / f'lib_{lib_id}'
 
+    for delay in delays:
+        for duration in durations:
 
-    print('Saving Results...')
-    stem = Path(results_filename).stem if results_filename else ''
-    filename = f'{stem}__lib_{lib_id}__delay_{delay}__dur_{duration}' if stem else f'lib_{lib_id}__delay_{delay}__dur_{duration}'
+            # Check whether results already exist for this parameter combination
+            # Skip if yes and recompute is False, else compute and save results
+            stem = Path(results_filename).stem if results_filename else ''
+            filename = f'{stem}__lib_{lib_id}__delay_{delay}__dur_{duration}' if stem else f'lib_{lib_id}__delay_{delay}__dur_{duration}.h5'
+            filepath = results_path / filename
 
-    outpath = save_results_new(rfs,
-                               unit_names_list,
-                               delay,
-                               duration,
-                               sigmas,
-                               thetas,
-                               frequencies,
-                               results_path=results_path,
-                               results_filename=filename)
-    
+            # Due to timeout and memory constraints it happened that some runs were killed mid-way, leaving behind corrupt result files.
+            # There we check here, wheter previous results exist and can be opened, before deciding to skip or recompute.
+            if filepath.exists() and not recompute:
+                try:
+                    with h5py.File(filepath, 'r'):
+                        pass
+                    print(f"Results for lib {lib_id}, delay {delay}, duration {duration} already exist at {filepath}. Skipping computation.")
+                    continue
+                except OSError:
+                    print(f"WARNING: corrupt results file at {filepath} — recomputing.")    
+                    filepath.unlink()
+
+            print(f'Computing Neuron Rates to Zebra Frames for delay {delay} & duration {duration}...')
+            # spike_times_list = make_typed_spike_list(spike_times_list)
+            _t0 = time.perf_counter()
+            neuron_rate_to_zebra_frames = compute_neuron_rate_to_zebra_frames(frame_onset_times, spike_times_list, delay, duration)
+            _elapsed = time.perf_counter() - _t0
+            print(f"---> compute_neuron_rate_to_zebra_frames took {_elapsed:.4f} s for {len(spike_times_list)} units")
+
+            print('Running Correlation Analysis...')
+            ## runs correlation analysis
+            rfs = au.PearsonCorrelationPinkNoise(#stim=wavelet_c.reshape(wavelet_c.shape[0], -1), 
+                                                    stim=wavelet_decomposition,        
+                                                    resp=neuron_rate_to_zebra_frames.T,
+                                                    neuron_pos=np.zeros((1,2)),  # dummy value for neuron_pos, 
+                                                    nx=wavelet_decomposition.shape[1], 
+                                                    ny=wavelet_decomposition.shape[2], 
+                                                    ns=ns, 
+                                                    n_frequencies=len(frequencies),
+                                                    n_phases=wavelet_decomposition.shape[-1],  # use actual number of phases from loaded decomposition
+                                                    visual_coverage=analysis_coverage, 
+                                                    screen_ratio=screen_ratio, 
+                                                    sigmas=sigmas_deg,
+                                                    plotting=False,
+                                                    n_thetas=n_thetas
+                                                    )
+
+            print('Saving Results...')
+            outpath = save_results(rfs,
+                                    unit_names_list,
+                                    delay,
+                                    duration,
+                                    sigmas,
+                                    thetas,
+                                    frequencies,
+                                    results_path=results_path,
+                                    results_filename=filename,
+                                    attributes=attributes
+                                    )
+            
