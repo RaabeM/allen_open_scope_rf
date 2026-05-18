@@ -2,13 +2,13 @@ import numpy as np
 import os
 import utils
 
-spike_times_dir = utils.derivitive_dir+'spike_times/'
-files_in_spike_times_dir = os.listdir(spike_times_dir)
-print(files_in_spike_times_dir)
+# spike_times_dir = utils.derivitive_dir+'spike_times/'
+# files_in_spike_times_dir = os.listdir(spike_times_dir)
+# print(files_in_spike_times_dir)
 
 """
 Parameters Gabor Library:
-    N_thetas (int): number of orientatuion equally spaced between 0 and 180 degree.
+    N_thetas (int): number of orientation equally spaced between 0 and 180 degree.
     Sigmas (list): standart deviation of theb gabor filters expressed in pixels (radius of the gaussian half peak wigth).
     Frequencies (list): spatial frequencies expressed in pixels per cycles.
     Phases (list): 0 and pi/2.
@@ -40,16 +40,18 @@ Parameters analysis:
 
 # List of default parameters for the Gabor Library
 gabor_param={
-    "N_thetas":"4",
-    "Sigmas": "[2, 3, 4, 5, 6, 8]",
+    "N_thetas":"10",
+    "Sigmas": "[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]",
     # "Frequencies": "[0.015, 0.04, 0.07, 0.1]",
-    "Frequencies":"0.036", # "0.072"
+    "Frequencies":"[0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 1.1, 1.2, 1.3]", #"0.036" #0.15
     "Phases": "[0, 90]",
     # "NX": "135",
     # "NY": "54",
-    "NX": "107", # TODO
-    "NY": "85",  # TODO
-    "Save Path":"../../../waven/gabors_library.npy"
+    # "NX": "107", # TODO
+    # "NY": "85",  # TODO
+    "NX" : 67,
+    "NY" : 53,
+    "Save Path":"../waven/gabors_library.npy"
 }
 
 # List of default parameters
@@ -66,18 +68,18 @@ param_defaults = {
     # "NX": "120", # TODO
     # "NY": "95",  # TODO
     "Resolution":"1.3671",
-    "Sigmas": "[2, 3, 4, 5, 6, 8]",
+    "Sigmas": "[2, 3, 4, 5, 6, 8, 9, 10]",
     # "Frequencies": "[0.015, 0.04, 0.07, 0.1]",
     # "Frequencies": "0.08",
     # "Visual Coverage":"[-135, 45, 34, -34]", # TODO
     "Visual Coverage":"[-60, 60, 47.5, -47.5]", # TODO
-    # "Analysis Coverage":"[-135, 45, 34, -34]", # TODO
+    # "Analysis Coverage":"[-   5, 45, 34, -34]", # TODO
     "Analysis Coverage": "[-60, 60, 47.5, -47.5]",
     "Number of Frames": "9000",
     "Number of Trials to Keep": "1",
     "Movie Path": "../../rawdata/allen_open_scope/stimulus/zebra/zebra_allen_screen_tscale_30_scale_10.mp4",
-    "Library Path": "../../../waven/gabors_library.npy",
-    "Spks Path": utils.derivitive_dir+'spike_times/'+files_in_spike_times_dir[0],
+    "Library Path": "../waven/filter_libraries/",
+    # "Spks Path": utils.derivitive_dir+'spike_times/'+files_in_spike_times_dir[0],
 }
 
 
@@ -85,15 +87,15 @@ param_defaults = {
 sigmas = eval(gabor_param["Sigmas"])
 nx = int(gabor_param["NX"])
 ny = int(gabor_param["NY"])
-n_theta = int(gabor_param["N_thetas"])
+n_thetas = int(gabor_param["N_thetas"])
 offsets= eval(gabor_param["Phases"])
 path_save = gabor_param["Save Path"]
 xs = np.arange(nx)
 ys = np.arange(ny)
-thetas = np.array([(i * np.pi) / n_theta for i in range(n_theta)])
+thetas = np.array([(i * np.pi) / n_thetas for i in range(n_thetas)])
 sigmas = np.array(sigmas)
 offsets=np.array(offsets)
-f =  eval(gabor_param["Frequencies"])
+frequencies =  eval(gabor_param["Frequencies"])
 
 path_directory = param_defaults["Path Directory"]
 dirs = [param_defaults["Dirs"]]
@@ -108,11 +110,11 @@ screen_x = int(param_defaults["screen_x"])
 screen_y = int(param_defaults["screen_y"])
 ns = len(sigmas)
 resolution=float(param_defaults["Resolution"])
-spks_path = param_defaults["Spks Path"]
+# spks_path = param_defaults["Spks Path"]
 nb_frames = int(param_defaults["Number of Frames"])
 n_trial2keep = int(param_defaults["Number of Trials to Keep"])
 movpath = param_defaults["Movie Path"]
-lib_path = param_defaults["Library Path"]
+library_path = param_defaults["Library Path"]
 screen_ratio = abs(visual_coverage[0]-visual_coverage[1])/nx
 xM, xm, yM, ym = analysis_coverage
 
