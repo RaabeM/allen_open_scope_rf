@@ -66,7 +66,7 @@ def load_dandi(dandi_filepath, dandiset_id, dandi_dirpath):
     file = dandiset.get_asset_by_path(dandi_filepath)
     file_url = file.download_url
     filename = dandi_filepath.split("/")[-1]
-    filepath = f"{dandi_dirpath}/{filename}"
+    filepath = f"{dandi_dirpath}/{filename}"    
     if os.path.exists(filepath):
         print("File already exists")
     else:
@@ -270,7 +270,9 @@ def PlotTuningCurve_Marcel(rfs, idx, visual_coverage, sigmas, screen_ratio, show
 
 
 def load_all_gabor_rf_results():
-    RESULTS_DIR = '../../results/allen_open_scope/rf/siegle/gabors/z-score_responses/new'
+    # RESULTS_DIR = '../../results/allen_open_scope/rf/siegle/gabors/z-score_responses/new'
+    RESULTS_DIR = '../../results/allen_open_scope/rf/siegle/gabors/z-score_responses/sub-820454_ses-ecephys-820454-2025-11-04-14-59-22_ecephys/100.0'
+
     results_files = [os.path.join(RESULTS_DIR, f) for f in os.listdir(RESULTS_DIR) if f.endswith('.h5')]
     results = []
     for file in results_files:
