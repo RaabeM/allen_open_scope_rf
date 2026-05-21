@@ -21,7 +21,7 @@ Open `waven_settings.py` and update the two path entries to point to your data:
 "Movie Path": "/path/to/zebra_allen_screen_tscale_30_scale_10.mp4",
 "Library Path": "/path/to/filter_libraries/",
 ```
-- `Movie Path`: Path to Zebra stimulus
+- `Movie Path`: Path to Zebra stimulus, can be downloaded from Open-Scope-Repo [Link](https://github.com/AllenNeuralDynamics/openscope-community-predictive-processing/blob/main/code/stimulus-control/src/Mindscope/movies/zebra_allen_screen_tscale_30_scale_10.mp4)
 - `Library Path`: Path to where the wavelet library will be saved
 
 
