@@ -2,16 +2,6 @@
 
 Receptive field mapping pipeline applied to [Allen Open Scope](https://dandiarchive.org/dandiset/001637) electrophysiology data. Zebra noise (pink noise video) stimuli are decomposed by a Gabor wavelet filter bank, and the resulting wavelet responses are cross-correlated with single-unit spike rates to estimate receptive field maps.
 
-## Method overview
-
-```
-Zebra noise video (.mp4)
-  → Gabor filter library (waven)
-  → Wavelet decomposition per frame
-  → Pearson correlation with signal (here: spike rates)
-  → Receptive field map per unit (.h5)
-```
-
 ## Setup
 
 ### 1. Install the environment
@@ -31,9 +21,12 @@ Open `waven_settings.py` and update the two path entries to point to your data:
 "Movie Path": "/path/to/zebra_allen_screen_tscale_30_scale_10.mp4",
 "Library Path": "/path/to/filter_libraries/",
 ```
+- `Movie Path`: Path to Zebra stimulus
+- `Library Path`: Path to where the wavelet library will be saved
 
 
 ## Running the pipeline
+**Caution:** Under the current settings loading the filter libraries takes **256 GB of RAM!** I am working on making it more handy.
 
 ### Wavelet RF mapping (main pipeline)
 
@@ -61,8 +54,6 @@ Each result file is an HDF5 with the following structure:
 /best_gabor_params_degree — (4, n_units)
 /abs_max_value           — (n_units,)
 ```
-
-**Caution:** Under the current settings loading the filter libraries takes **256 GB of RAM!**
 
 ### Optimize parameters
 
