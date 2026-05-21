@@ -1,0 +1,28 @@
+name: waven_dandi
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy
+  - pandas
+  - matplotlib
+  - scipy
+  - h5py
+  - tifffile
+  - scikit-image
+  - scikit-learn
+  - seaborn
+  - tqdm
+  - numba
+  - tensorly
+  - opencv
+  - dandi
+  - pynwb
+  - ipykernel
+  - pip
+  - pip:
+      - torch
+      - torchvision
+      - elephant
+      - remfile
+      - git+https://github.com/RaabeM/waven.git@develop
