@@ -41,7 +41,7 @@ Parameters analysis:
 # List of default parameters for the Gabor Library
 gabor_param={
     "N_thetas":"10",
-    "Sigmas": "[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]",
+    "Sigmas": "[2, 3, 4, 5, 6, 7, 8]",
     # "Frequencies": "[0.015, 0.04, 0.07, 0.1]",
     "Frequencies":"[0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 1.1, 1.2, 1.3]", #"0.036" #0.15
     "Phases": "[0, 90]",
@@ -68,7 +68,7 @@ param_defaults = {
     # "NX": "120", # TODO
     # "NY": "95",  # TODO
     "Resolution":"1.3671",
-    "Sigmas": "[2, 3, 4, 5, 6, 8, 9, 10]",
+    "Sigmas": "[2, 3, 4, 5, 6, 8]",
     # "Frequencies": "[0.015, 0.04, 0.07, 0.1]",
     # "Frequencies": "0.08",
     # "Visual Coverage":"[-135, 45, 34, -34]", # TODO
@@ -134,5 +134,3 @@ if (visual_coverage!=analysis_coverage):
 else:
     ratio_x=1
     ratio_y=1
-
-print(ratio_x, ratio_y)
