@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 import h5py
@@ -10,6 +11,7 @@ import remfile
 import requests
 import pandas as pd
 from dandi.dandiapi import DandiAPIClient
+from tqdm.auto import tqdm
 
 DANDISET_ID = "001637"
 
@@ -76,7 +78,7 @@ class NWBStream:
 
         Avoids pynwb's to_dataframe() which triggers one HTTP request per
         HDF5 chunk for spike_times and per-unit DynamicTableRegion expansion
-        for electrodes. Instead, reads both as single bulk h5py reads.
+        for electrodes. Instead, reads both as single bulk h5py reads. 
 
         probe: substring matched against electrode group_name, e.g. 'ProbeB'.
         """
@@ -98,7 +100,8 @@ class NWBStream:
         df = pd.DataFrame(data)
 
         # --- probe column: one bulk read of the electrodes table ---
-        group_names = np.array(self._h5["electrodes"]["group_name"].asstr()[:])
+        elec_h5     = self.nwb.electrodes["group_name"].data.parent
+        group_names = np.array(elec_h5["group_name"].asstr()[:])
         elec_flat   = h5u["electrodes"][:]
         elec_bounds = np.concatenate([[0], h5u["electrodes_index"][:]])
         df["probe"] = [
@@ -191,6 +194,21 @@ class DandiSession:
             asset_id=asset_id,
         )
 
+    def download(self, asset_id: str, dest: str | Path) -> Path:
+        """Download a DANDI asset to a local file via the DANDI API. Returns the saved path."""
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        asset = self._ds.get_asset(asset_id)
+        downloader = asset.get_download_file_iter()
+        with dest.open("wb") as f, tqdm(
+            total=asset.size, unit="B", unit_scale=True, unit_divisor=1024,
+            desc=dest.name,
+        ) as bar:
+            for chunk in downloader(0):
+                f.write(chunk)
+                bar.update(len(chunk))
+        return dest
+
 
 # ---------------------------------------------------------------------------
 # Public shortcut
@@ -199,3 +217,21 @@ class DandiSession:
 def open_nwb(asset_id: str, dandiset_id: str = DANDISET_ID) -> NWBStream:
     """Stream a DANDI NWB file by asset ID without downloading it."""
     return DandiSession(dandiset_id).open(asset_id)
+
+
+def open_local(path: str | Path, asset_id: str = "") -> NWBStream:
+    """Open a locally saved NWB file as an NWBStream.
+
+    Identical interface to open_nwb() — all NWBStream methods work the same.
+    asset_id is optional metadata; leave blank if the file wasn't from DANDI.
+    """
+    h5  = h5py.File(Path(path), "r")
+    io  = pynwb.NWBHDF5IO(file=h5, load_namespaces=True, mode="r")
+    nwb = io.read()
+    return NWBStream(
+        nwb=nwb,
+        io=io,
+        _h5=h5,
+        modality=_detect_modality(nwb),
+        asset_id=asset_id,
+    )
