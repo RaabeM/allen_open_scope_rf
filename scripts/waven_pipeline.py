@@ -111,7 +111,7 @@ def create_gabor_library(xs, ys, thetas, sigmas, offsets, frequencies,
             break
 
     # create library with user-provided function
-    lib = wg.makeFilterLibrary2(xs, ys, thetas, sigmas, offsets, frequencies)
+    lib = wg.makeFilterLibrary2(xs, ys, thetas, sigmas, np.deg2rad(offsets), frequencies) # Note: Converting offsets to radians here is not very beautiful, but allow only minor mixes to prior analysis
     if not isinstance(lib, np.ndarray):
         lib = np.asarray(lib)
 
