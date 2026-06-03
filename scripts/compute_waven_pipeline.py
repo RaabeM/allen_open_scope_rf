@@ -23,6 +23,7 @@ import optimize_waven_parameters as owp
 def main(nwb_path=None, results_dir=None, probe_idx=0):
 
     results_dir = Path(results_dir)
+    session_name = Path(nwb_path).stem
 
     delays = np.arange(0.0, 0.35, 0.05)
     durations = np.arange(0.03, 0.28, 0.05)
@@ -36,8 +37,8 @@ def main(nwb_path=None, results_dir=None, probe_idx=0):
     probe = probes[probe_idx]
 
     # for probe in units_df['probe'].unique():
-    unit_names = units_df.loc[units_df['probe'] == probe, 'unit_name']
-    spiketimes = units_df.loc[units_df['probe'] == probe, 'spike_times']
+    unit_names = units_df.loc[units_df['probe'] == probe, 'unit_name'].values
+    spiketimes = units_df.loc[units_df['probe'] == probe, 'spike_times'].values
 
     zebra_df = stream.zebra_df()
     for i_trial, trialnumber in enumerate(zebra_df['TrialNumber'].unique()):
@@ -45,14 +46,14 @@ def main(nwb_path=None, results_dir=None, probe_idx=0):
         frame_onset_times = zebra_df.loc[zebra_df['TrialNumber'] == trialnumber, 'start_time'].values
 
 
-        attributes = {'session' : os.path.basename(nwb_path), 
+        attributes = {'session' : session_name, 
                         'probe' : probe, 
                         'date_computed' : datetime.today().strftime('%Y-%m-%d'),
                         'nwb_trialnumber' : trialnumber,
                         'trial' : i_trial,
                         }
 
-        for phase in ['0', '1']:
+        for phase in ['1']:#['0', '1']:
             results_path = results_dir/probe/f'trial_{i_trial}'/f'phase_{phase}'
             results_path = full_pipeline(frame_onset_times,
                     spiketimes,
@@ -64,16 +65,20 @@ def main(nwb_path=None, results_dir=None, probe_idx=0):
                     results_path=results_path,
                     results_filename='',
                     attributes=attributes,
-                    recompute=False,
+                    recompute=True,
                     phase=phase,
                     )
             
             # Optimize parameters 
             print('Optimizing parameters...')
-            out = results_path/"best_params.h5"
-            df = owp.optimize_parameters(args.results_dir)
+            print(results_path)
+            outpath = Path(f"/mnt/ceph-hdd/projects/cidbn_wibral_neuro_nonhuman/SPP2205_mraabe/results/allen_open_scope/rf/waven/zebra/optimized/{session_name}")
+            stem = f"optimized__{session_name}__{probe}__trial_{i_trial}__phase_{phase}"
+            csv_out = outpath / (stem + ".csv")
+            h5_out = outpath / (stem + ".h5")
+            df = owp.optimize_parameters(results_dir=results_path, output_path=csv_out)
             df = owp.load_rf_maps(df)
-            owp.save_rf_results(df, out)
+            owp.save_rf_results(df, h5_out)
 
 
 if __name__ == "__main__":
