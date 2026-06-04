@@ -53,7 +53,7 @@ def main(nwb_path=None, results_dir=None, probe_idx=0):
                         'trial' : i_trial,
                         }
 
-        for phase in ['1']:#['0', '1']:
+        for phase in ['0', '1']:
             results_path = results_dir/probe/f'trial_{i_trial}'/f'phase_{phase}'
             results_path = full_pipeline(frame_onset_times,
                     spiketimes,
