@@ -269,9 +269,21 @@ def PlotTuningCurve_Marcel(rfs, idx, visual_coverage, sigmas, screen_ratio, show
     return [cc_f_1_xy.T, i*v[1][::-1], i*u[:, 1], ori_tun, cc_f_1_o[o, :]]
 
 
-def load_all_gabor_rf_results():
+def load_all_gabor_rf_results(results_dir=None):
+    """One row per (unit, orientation) from the per-unit gabor spike-count files.
+
+    results_dir: directory of the .h5 files. The default below is where they used
+    to live; the tree has since moved under .../gabors/backup/, so callers that
+    still rely on the default will not find it. Pass the directory explicitly.
+    """
     # RESULTS_DIR = '../../results/allen_open_scope/rf/siegle/gabors/z-score_responses/new'
-    RESULTS_DIR = '../../results/allen_open_scope/rf/siegle/gabors/z-score_responses/sub-820454_ses-ecephys-820454-2025-11-04-14-59-22_ecephys/100.0'
+    RESULTS_DIR = results_dir or '../../results/allen_open_scope/rf/siegle/gabors/z-score_responses/sub-820454_ses-ecephys-820454-2025-11-04-14-59-22_ecephys/100.0'
+
+    if not os.path.isdir(RESULTS_DIR):
+        raise FileNotFoundError(
+            f'{RESULTS_DIR} does not exist. Pass results_dir= pointing at the '
+            'directory holding the gabors_spikecount_*.h5 files.'
+        )
 
     results_files = [os.path.join(RESULTS_DIR, f) for f in os.listdir(RESULTS_DIR) if f.endswith('.h5')]
     results = []

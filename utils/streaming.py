@@ -78,7 +78,11 @@ class NWBStream:
 
         Avoids pynwb's to_dataframe() which triggers one HTTP request per
         HDF5 chunk for spike_times and per-unit DynamicTableRegion expansion
-        for electrodes. Instead, reads both as single bulk h5py reads. 
+        for electrodes. Instead, reads both as single bulk h5py reads.
+
+        Adds a 'probe' column (electrode group_name) and, when the electrodes
+        table has it, a 'location' column — CCF structure acronym with
+        cortical layer suffix where applicable, e.g. 'VISp5'.
 
         probe: substring matched against electrode group_name, e.g. 'ProbeB'.
         """
@@ -99,7 +103,7 @@ class NWBStream:
                 pass
         df = pd.DataFrame(data)
 
-        # --- probe column: one bulk read of the electrodes table ---
+        # --- probe / location columns: one bulk read of the electrodes table ---
         elec_h5     = self.nwb.electrodes["group_name"].data.parent
         group_names = np.array(elec_h5["group_name"].asstr()[:])
         elec_flat   = h5u["electrodes"][:]
@@ -108,6 +112,12 @@ class NWBStream:
             group_names[elec_flat[elec_bounds[i]:elec_bounds[i + 1]]][0]
             for i in range(len(df))
         ]
+        if "location" in elec_h5:
+            locations = np.array(elec_h5["location"].asstr()[:])
+            df["location"] = [
+                locations[elec_flat[elec_bounds[i]:elec_bounds[i + 1]]][0]
+                for i in range(len(df))
+            ]
 
         # --- probe filter before loading spike_times ---
         if probe is not None:
@@ -128,8 +138,16 @@ class NWBStream:
         return df
 
     def zebra_df(self) -> pd.DataFrame:
-        """Zebra noise stimulus presentation table (start_time, stop_time, ...)."""
-        _require_modality(self.modality, "ecephys", "zebra_df")
+        """Zebra noise stimulus presentation table (start_time, stop_time, ...).
+
+        SLAP2 sessions list the Zebra movie as a block inside the 'movie'
+        table — one row per repeat rather than one row per frame; see
+        zebra_frame_times() for reconstructed per-frame onsets.
+        """
+        # _require_modality(self.modality, "ecephys", "zebra_df")
+        if self.modality == "slap2":
+            movie = self.nwb.intervals["movie"].to_dataframe()
+            return movie[movie["BlockLabel"] == "Zebra"].reset_index(drop=True)
         return self.nwb.intervals["Zebra_presentations"].to_dataframe()
 
     def gabor_rf_df(self) -> pd.DataFrame:
@@ -158,10 +176,200 @@ class NWBStream:
             columns=dff_ts.timestamps[:],
         )
 
+    def events_df(self, plane: str) -> pd.DataFrame:
+        """OASIS-deconvolved events for a given imaging plane.
+
+        Same layout, ROI order and timestamps as dff_df(plane). The NWB events
+        are the output of aind-ophys-oasis-event-detection with its default
+        (auto-estimated) parameters, so no deconvolution is needed here.
+        """
+        _require_modality(self.modality, "mesoscope", "events_df")
+        events_ts = self.nwb.processing[plane]["event_timeseries"]
+        return pd.DataFrame(
+            events_ts.data[:].T,
+            columns=events_ts.timestamps[:],
+        )
+
     # --- SLAP2 ---
 
-    def slap2_dff(self) -> pd.DataFrame:
-        raise NotImplementedError("SLAP2 NWBs not yet on DANDI")
+    def dmds(self) -> list[str]:
+        """Names of the DMD imaging planes present, e.g. ['DMD1', 'DMD2']."""
+        _require_modality(self.modality, "slap2", "dmds")
+        ophys = self.nwb.processing["ophys"]
+        return sorted(
+            k.replace("Fluorescence_", "")
+            for k in ophys.data_interfaces
+            if k.startswith("Fluorescence_")
+        )
+
+    def _slap2_series(
+        self,
+        kind: str,
+        dmd: str,
+        channel: str,
+        t_start: float | None,
+        t_stop: float | None,
+    ) -> pd.DataFrame:
+        _require_modality(self.modality, "slap2", f"slap2_{kind.lower()}")
+        rrs = self.nwb.processing["ophys"][f"Fluorescence_{dmd}"][f"{dmd}_{kind}_{channel}"]
+
+        times = rrs.timestamps[:]
+        i0 = 0 if t_start is None else int(np.searchsorted(times, t_start))
+        i1 = len(times) if t_stop is None else int(np.searchsorted(times, t_stop))
+
+        # stored as (n_timepoints, n_rois); transposed to match dff_df()
+        return pd.DataFrame(rrs.data[i0:i1, :].T, columns=times[i0:i1])
+
+    def slap2_dff(
+        self,
+        dmd: str = "DMD1",
+        channel: str = "green",
+        t_start: float | None = None,
+        t_stop: float | None = None,
+    ) -> pd.DataFrame:
+        """ΔF/F traces for one DMD, shape (n_rois, n_timepoints).
+
+        Columns are timestamps in seconds — same layout as dff_df().
+        channel: 'green' (iGluSnFR4f) or 'red' (RCaMP3).
+        t_start / t_stop: restrict to a time window (seconds) so that only that
+        slice is read from disk; the full traces are several hundred MB.
+        """
+        return self._slap2_series("dFF", dmd, channel, t_start, t_stop)
+
+    def slap2_f0(
+        self,
+        dmd: str = "DMD1",
+        channel: str = "green",
+        t_start: float | None = None,
+        t_stop: float | None = None,
+    ) -> pd.DataFrame:
+        """Raw F0 fluorescence traces for one DMD. Same layout as slap2_dff()."""
+        return self._slap2_series("F0", dmd, channel, t_start, t_stop)
+
+    def slap2_rois(self, dmd: str = "DMD1") -> pd.DataFrame:
+        """ROI table for one DMD: id, pixel count, centroid, z range, pixel mask.
+
+        Row order matches the row order of slap2_dff() / slap2_f0().
+        Centroids are weighted by the pixel mask weights, in image pixels.
+        """
+        _require_modality(self.modality, "slap2", "slap2_rois")
+        ps = self.nwb.processing["ophys"]["ImageSegmentation"][f"PlaneSegmentation_{dmd}"]
+
+        rows = []
+        for i, roi_id in enumerate(ps.id[:]):
+            mask = np.asarray(ps["pixel_mask"][i])
+            x, y, w = mask["x"], mask["y"], mask["weight"]
+            wsum = w.sum()
+            rows.append({
+                "roi_id":     roi_id,
+                "n_pixels":   len(mask),
+                "x":          float((x * w).sum() / wsum) if wsum else float(x.mean()),
+                "y":          float((y * w).sum() / wsum) if wsum else float(y.mean()),
+                "z_min":      int(ps["z_min"][i]),
+                "z_max":      int(ps["z_max"][i]),
+                "pixel_mask": mask,
+            })
+        return pd.DataFrame(rows)
+
+    def slap2_roi_labels(self, dmd: str = "DMD1") -> np.ndarray:
+        """Label image (n_y, n_x) holding row-index + 1 inside each ROI, 0 outside.
+
+        Shaped to match slap2_mean_image(); overlapping ROIs keep the later row.
+        """
+        rois   = self.slap2_rois(dmd)
+        labels = np.zeros(self.slap2_mean_image(dmd).shape, dtype=int)
+        for i, mask in enumerate(rois["pixel_mask"]):
+            labels[mask["y"].astype(int), mask["x"].astype(int)] = i + 1
+        return labels
+
+    def slap2_mean_image(self, dmd: str = "DMD1", channel: int = 0) -> np.ndarray:
+        """Mean image (n_y, n_x) for one DMD. channel: 0 (green) or 1 (red)."""
+        _require_modality(self.modality, "slap2", "slap2_mean_image")
+        img = self.nwb.processing["ophys"][f"{dmd}_mean_image_channel{channel}"]
+        return np.asarray(img.data[0])
+
+    def slap2_activity_image(self, dmd: str = "DMD1") -> np.ndarray:
+        """Activity image (n_y, n_x) for one DMD."""
+        _require_modality(self.modality, "slap2", "slap2_activity_image")
+        img = self.nwb.processing["ophys"][f"{dmd}_activity_image"]
+        return np.asarray(img.data[0]).squeeze()
+
+    def slap2_segments(self, dmd: str = "DMD1", channel: str = "green") -> pd.DataFrame:
+        """Continuous acquisition segments, inferred from gaps in the timestamps.
+
+        SLAP2 does not image continuously: it records in bouts of ~30 s with a
+        short blanking period in between. Returns one row per bout with its
+        start/stop time, sample count, and index range into slap2_dff().
+        """
+        _require_modality(self.modality, "slap2", "slap2_segments")
+        rrs = self.nwb.processing["ophys"][f"Fluorescence_{dmd}"][f"{dmd}_dFF_{channel}"]
+
+        times = rrs.timestamps[:]
+        dt    = np.diff(times)
+        gaps  = np.where(dt > 5 * np.median(dt))[0]
+
+        starts = np.concatenate([[0], gaps + 1])
+        stops  = np.concatenate([gaps, [len(times) - 1]])
+        return pd.DataFrame({
+            "start_time": times[starts],
+            "stop_time":  times[stops],
+            "duration":   times[stops] - times[starts],
+            "n_samples":  stops - starts + 1,
+            "i_start":    starts,
+            "i_stop":     stops,
+        })
+
+    # --- Stimulus tables (all modalities) ---
+
+    def stim_tables(self) -> list[str]:
+        """Names of the stimulus interval tables in this session."""
+        return list(self.nwb.intervals)
+
+    def stim_df(self, name: str) -> pd.DataFrame:
+        """One stimulus interval table as a DataFrame."""
+        return self.nwb.intervals[name].to_dataframe()
+
+    def zebra_frame_times(self, fps: float = 30.0) -> pd.DataFrame:
+        """Per-frame onset times of the Zebra movie, one row per frame.
+
+        The SLAP2 NWB stores the Zebra movie as a single interval per repeat
+        instead of one row per frame, so frame onsets are reconstructed by
+        assuming a constant `fps` within each block. Columns: TrialNumber,
+        frame, start_time, stop_time.
+        """
+        blocks = self.zebra_df()
+        out = []
+        for _, b in blocks.iterrows():
+            n = int(round((b["stop_time"] - b["start_time"]) * fps))
+            frames = np.arange(n)
+            out.append(pd.DataFrame({
+                "TrialNumber": b["TrialNumber"],
+                "frame":       frames,
+                "start_time":  b["start_time"] + frames / fps,
+                "stop_time":   b["start_time"] + (frames + 1) / fps,
+            }))
+        return pd.concat(out, ignore_index=True)
+
+    # --- Behaviour (all modalities) ---
+
+    def running_df(self) -> pd.DataFrame:
+        """Running speed (cm/s) against time, as a two-column DataFrame."""
+        ts = self.nwb.processing["running"]["running_speed"]
+        return pd.DataFrame({"time": ts.timestamps[:], "speed": ts.data[:]})
+
+    def pupil_df(self) -> pd.DataFrame:
+        """Pupil tracking table (position, width, height, area) against time.
+
+        A boolean 'blink' column is joined in from likely_blink_times when the
+        session has one. Beware the two different missing-data conventions:
+        'area' marks unfitted frames with -1, every other column uses NaN — so
+        mask on 'blink' rather than trusting 'area'.
+        """
+        eye = self.nwb.processing["eye_tracking"]
+        df  = eye["pupil"].to_dataframe()
+        if "likely_blink_times" in eye.data_interfaces:
+            df["blink"] = np.asarray(eye["likely_blink_times"].data[:], dtype=bool)
+        return df
 
 
 # ---------------------------------------------------------------------------
