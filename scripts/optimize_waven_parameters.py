@@ -53,7 +53,13 @@ def discover_files(results_dir: str | Path) -> list[Path]:
     for f in files:
         try:
             with h5py.File(f, "r") as hf:
-                if "abs_max_value" in hf and "unit_ids" in hf:
+                if (
+                    "abs_max_value" in hf
+                    and "unit_ids" in hf
+                    and "best_gabor_params_idx" in hf
+                    and "delay" in hf.attrs
+                    and "sigmas" in hf.attrs
+                ):
                     valid.append(f)
         except OSError:
             pass
@@ -68,6 +74,8 @@ def optimize_parameters(
     results_dir: str | Path,
     output_path: str | Path | None = None,
     all_values_path: str | Path | None = None,
+    include_negative: bool = False,
+    extract_tuning_curves: bool = False,
 ) -> pd.DataFrame:
     """
     Scan all waven result files under results_dir and return a DataFrame
@@ -120,6 +128,9 @@ def optimize_parameters(
             print(f"WARNING: skipping {filepath}: {e}")
             continue
 
+        if not include_negative and (delay < 0 or duration < 0):
+            continue
+
         for i, uid in enumerate(unit_ids):
             val = abs_max[i]
             all_rows.append({"unit_id": uid, "delay": delay, "duration": duration, "abs_max_value": val})
@@ -156,17 +167,29 @@ def optimize_parameters(
         print(f"Saved {len(df)} units → {output_path}")
 
     # resolve all_values_path: explicit > sibling of output_path > skip
-    all_values_path = output_path.parent / (output_path.stem + "_all_values.csv")
-    all_values_path.parent.mkdir(parents=True, exist_ok=True)
+    if all_values_path is None and output_path is not None:
+        all_values_path = output_path.parent / (output_path.stem + "_all_values.csv")
+    if all_values_path is not None:
+        all_values_path = Path(all_values_path)
     df_all = (
         pd.DataFrame(all_rows)
         .sort_values(["unit_id", "delay", "duration"])
         .reset_index(drop=True)
     )
-    df_all.to_csv(all_values_path, index=False)
-    print(f"Saved {len(df_all)} (unit, delay, duration) rows → {all_values_path}")
+    if all_values_path is not None:
+        all_values_path.parent.mkdir(parents=True, exist_ok=True)
+        df_all.to_csv(all_values_path, index=False)
+        print(f"Saved {len(df_all)} (unit, delay, duration) rows → {all_values_path}")
 
-    return output_path if output_path is not None else df
+    if extract_tuning_curves:
+        print("Extracting tuning curves from best delay/duration files…")
+        df = _extract_tuning_curves(df)
+
+    if output_path is not None:
+        h5_path = Path(output_path).with_suffix(".h5")
+        save_rf_results(df, h5_path)
+
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -241,35 +264,105 @@ _SCALAR_COLS = [
     "xi", "yi", "theta_idx", "sigma_idx", "frequency_idx",
 ]
 _STRING_COLS = ["lib_id", "source_file"]
+_TUNING_CURVE_NAMES = [
+    "tuning_azimuth",      # correlation vs x position  (nx,)
+    "tuning_elevation",    # correlation vs y position  (ny,)
+    "tuning_orientation",  # correlation vs theta       (n_thetas,)
+    "tuning_size",         # correlation vs sigma       (ns,)
+    "tuning_frequency",    # correlation vs frequency   (n_freq,)
+]
+
+
+def _extract_tuning_curves(df: pd.DataFrame) -> pd.DataFrame:
+    """Add 1D tuning curve columns to df from each unit's best source file.
+
+    For each unit the correlation_matrix in its best source file is sliced at
+    the stored best parameter indices, varying one parameter at a time while
+    holding the others fixed.  The five new columns each contain a 1D float32
+    array per unit.
+    """
+    curves: dict[str, list] = {name: [None] * len(df) for name in _TUNING_CURVE_NAMES}
+
+    for source_file, grp in tqdm(df.groupby("source_file"), desc="Extracting tuning curves"):
+        try:
+            with h5py.File(source_file, "r") as hf:
+                file_unit_ids = hf["unit_ids"][:].astype(str)
+                uid_to_row = {uid: r for r, uid in enumerate(file_unit_ids)}
+                cm = hf["correlation_matrix"]  # lazy (n_units, nx, ny, n_thetas, ns, n_freq)
+
+                for df_idx, unit in grp.iterrows():
+                    row = uid_to_row.get(str(unit["unit_id"]))
+                    if row is None:
+                        continue
+                    xi = int(unit["xi"])
+                    yi = int(unit["yi"])
+                    ti = int(unit["theta_idx"])
+                    si = int(unit["sigma_idx"])
+                    fi = int(unit["frequency_idx"])
+
+                    # load one unit's slice; cast from stored float16 to float32
+                    block = cm[row].astype(np.float32)  # (nx, ny, n_thetas, ns, n_freq)
+                    curves["tuning_azimuth"][df_idx]     = block[:, yi, ti, si, fi]
+                    curves["tuning_elevation"][df_idx]   = block[xi, :, ti, si, fi]
+                    curves["tuning_orientation"][df_idx] = block[xi, yi, :, si, fi]
+                    curves["tuning_size"][df_idx]        = block[xi, yi, ti, :, fi]
+                    curves["tuning_frequency"][df_idx]   = block[xi, yi, ti, si, :]
+        except OSError as e:
+            print(f"WARNING: could not open {source_file}: {e}")
+
+    for name, vals in curves.items():
+        df[name] = vals
+    return df
 
 
 def save_rf_results(df: pd.DataFrame, output_path: str | Path) -> Path:
     """
-    Save the DataFrame returned by load_rf_maps to a single HDF5 file.
+    Save the DataFrame to a single HDF5 file.
 
     Layout
     ------
-    /unit_ids   — (n_units,) unit identifier strings
-    /rf_maps    — (n_units, nx, ny) float32, gzip-compressed
-    /<col>      — one dataset per scalar / string column
+    /unit_ids          — (n_units,) unit identifier strings
+    /rf_maps           — (n_units, nx, ny) float32, gzip-compressed  [if present]
+    /tuning_azimuth    — (n_units, nx)       float32, gzip-compressed [if present]
+    /tuning_elevation  — (n_units, ny)       float32, gzip-compressed [if present]
+    /tuning_orientation— (n_units, n_thetas) float32, gzip-compressed [if present]
+    /tuning_size       — (n_units, ns)       float32, gzip-compressed [if present]
+    /tuning_frequency  — (n_units, n_freq)   float32, gzip-compressed [if present]
+    /<col>             — one dataset per scalar / string column
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    maps = np.stack(df["rf_map"].values)   # (n_units, nx, ny)
+    tmp_path = output_path.with_suffix(".h5.tmp")
+    try:
+        with h5py.File(tmp_path, "w") as hf:
+            dt = h5py.string_dtype()
+            hf.create_dataset("unit_ids", data=df["unit_id"].tolist(), dtype=dt)
 
-    with h5py.File(output_path, "w") as hf:
-        dt = h5py.string_dtype()
-        hf.create_dataset("unit_ids", data=df["unit_id"].tolist(), dtype=dt)
-        hf.create_dataset("rf_maps", data=maps, compression="gzip", compression_opts=4)
+            if "rf_map" in df.columns and df["rf_map"].notna().any():
+                maps = np.stack(df["rf_map"].values)   # (n_units, nx, ny)
+                hf.create_dataset("rf_maps", data=maps, compression="gzip", compression_opts=4)
 
-        for col in _SCALAR_COLS:
-            if col in df.columns:
-                hf.create_dataset(col, data=df[col].values)
+            for col in _SCALAR_COLS:
+                if col in df.columns:
+                    hf.create_dataset(col, data=df[col].values)
 
-        for col in _STRING_COLS:
-            if col in df.columns:
-                hf.create_dataset(col, data=df[col].tolist(), dtype=dt)
+            for col in _STRING_COLS:
+                if col in df.columns:
+                    hf.create_dataset(col, data=df[col].tolist(), dtype=dt)
+
+            for name in _TUNING_CURVE_NAMES:
+                if name in df.columns and df[name].notna().any():
+                    hf.create_dataset(
+                        name,
+                        data=np.stack(df[name].values),
+                        compression="gzip",
+                        compression_opts=4,
+                    )
+        tmp_path.rename(output_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
     print(f"Saved {len(df)} units → {output_path}")
     return output_path
@@ -279,13 +372,17 @@ def load_rf_results(path: str | Path) -> pd.DataFrame:
     """
     Load a file written by save_rf_results.
 
-    Returns the same DataFrame structure as load_rf_maps, with
-    an 'rf_map' column containing (nx, ny) float32 arrays.
+    Returns a DataFrame with scalar columns and, when present:
+      'rf_map'            — (nx, ny) float32 arrays
+      'tuning_azimuth'    — (nx,)       float32 arrays
+      'tuning_elevation'  — (ny,)       float32 arrays
+      'tuning_orientation'— (n_thetas,) float32 arrays
+      'tuning_size'       — (ns,)       float32 arrays
+      'tuning_frequency'  — (n_freq,)   float32 arrays
     """
     path = Path(path)
     with h5py.File(path, "r") as hf:
         unit_ids = hf["unit_ids"][:].astype(str)
-        maps = hf["rf_maps"][:]   # (n_units, nx, ny)
 
         data: dict = {"unit_id": unit_ids}
         for col in _SCALAR_COLS:
@@ -295,8 +392,21 @@ def load_rf_results(path: str | Path) -> pd.DataFrame:
             if col in hf:
                 data[col] = hf[col][:].astype(str)
 
+        rf_maps = hf["rf_maps"][:] if "rf_maps" in hf else None
+
+        tc_arrays = {}
+        for name in _TUNING_CURVE_NAMES:
+            if name in hf:
+                tc_arrays[name] = hf[name][:]
+
     df = pd.DataFrame(data)
-    df["rf_map"] = [maps[i] for i in range(len(df))]
+
+    if rf_maps is not None:
+        df["rf_map"] = [rf_maps[i] for i in range(len(df))]
+
+    for name, arr in tc_arrays.items():
+        df[name] = [arr[i] for i in range(len(df))]
+
     return df
 
 
@@ -315,15 +425,34 @@ def main():
     parser.add_argument(
         "--output", "-o",
         default=None,
-        help="Path to save results. Defaults to <results_dir>/best_params.h5.",
+        help="Base output path (e.g. best_params.csv). HDF5 saved at same stem with .h5. "
+             "Defaults to <results_dir>/best_params.csv.",
+    )
+    parser.add_argument(
+        "--include-negative",
+        action="store_true",
+        default=False,
+        help="Include files with negative delay or duration in the optimisation. "
+             "Excluded by default.",
+    )
+    parser.add_argument(
+        "--tuning-curves",
+        action="store_true",
+        default=False,
+        help="Extract 1D tuning curves (azimuth, elevation, orientation, size, frequency) "
+             "and store them in the output HDF5. Skipped by default.",
     )
     args = parser.parse_args()
 
-    out = args.output or str(Path(args.results_dir) / "best_params.h5")
+    csv_out = args.output or str(Path(args.results_dir) / "best_params.csv")
+    h5_out = str(Path(csv_out).with_suffix(".h5"))
 
-    df = optimize_parameters(args.results_dir, args.output)
+    # optimize_parameters scans files, saves CSV + HDF5 (tuning curves optional)
+    df = optimize_parameters(args.results_dir, csv_out, include_negative=args.include_negative,
+                             extract_tuning_curves=args.tuning_curves)
+    # load_rf_maps adds 2D spatial RF maps; save_rf_results writes the final HDF5
     df = load_rf_maps(df)
-    save_rf_results(df, out)
+    save_rf_results(df, h5_out)
 
     print(f"\nSummary ({len(df)} units):")
     print(df[["unit_id", "delay", "duration", "abs_max_value",

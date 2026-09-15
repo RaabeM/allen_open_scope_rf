@@ -25,8 +25,12 @@ def main(nwb_path=None, results_dir=None, probe_idx=0):
     results_dir = Path(results_dir)
     session_name = Path(nwb_path).stem
 
-    delays = np.arange(0.0, 0.35, 0.05)
+    # delays = np.arange(0.0, 0.35, 0.05)
     durations = np.arange(0.03, 0.28, 0.05)
+    durations *= -1
+    # delays = np.array([0.01, 0.02, 0.03, 0.04, 0.06, 0.07, 0.08, 0.09])
+    delays = -1 * np.array([0.01, 0.02, 0.035, 0.05, 0.075, 0.1, 0.125, 0.15])
+
 
     print('Loading Dandi NWB file...')
     stream = utils.open_local(nwb_path)
@@ -65,7 +69,7 @@ def main(nwb_path=None, results_dir=None, probe_idx=0):
                     results_path=results_path,
                     results_filename='',
                     attributes=attributes,
-                    recompute=True,
+                    recompute=False,
                     phase=phase,
                     )
             

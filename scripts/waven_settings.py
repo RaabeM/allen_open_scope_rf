@@ -77,7 +77,8 @@ param_defaults = {
     "Analysis Coverage": "[-60, 60, 47.5, -47.5]",
     "Number of Frames": "9000",
     "Number of Trials to Keep": "1",
-    "Movie Path": "/user/raabe14/u19361/workspace-allen/rawdata/stimulus/zebra/zebra_allen_screen_tscale_30_scale_10.mp4",
+    # "Movie Path": "/user/raabe14/u19361/workspace-allen/rawdata/stimulus/zebra/zebra_allen_screen_tscale_30_scale_10.mp4",
+    "Movie Path": "/mnt/ceph-hdd/projects/cidbn_wibral_neuro_nonhuman/SPP2205_mraabe/rawdata/allen_open_scope/stimulus/zebra/zebra_allen_screen_tscale_30_scale_10.mp4",
     "Library Path": "../../waven/filter_libraries/",
     # "Spks Path": utils.derivitive_dir+'spike_times/'+files_in_spike_times_dir[0],
 }
