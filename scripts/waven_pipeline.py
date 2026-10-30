@@ -1,86 +1,83 @@
-import torch
+# Author: Marcel C. Raabe
+# Date: 2026-10-29
+"""Core of the waven RF mapping of the Zebra noise movie, shared by all modalities.
 
-def dummy_cuda(self, device=None, non_blocking=False):
-    return self  # just return the same tensor (on CPU)
+Builds (or reuses) the Gabor filter library, the downsampled movie and its
+wavelet decomposition, resamples the neural activity onto the movie frames and
+correlates the two (`full_pipeline`). The compute_waven_pipeline_*.py drivers and
+the null-distribution scripts build on the functions here.
 
-# If no no GPU is available prevent cuda calls 
-if not torch.cuda.is_available():
-    print("CUDA is not available. Running on CPU.")
-    torch.Tensor.cuda = dummy_cuda
-    torch.nn.Module.cuda = dummy_cuda
-else:
-    print(f"CUDA is available. Using GPU: {torch.cuda.get_device_name(0)}")
+Every response window in this module is half-open, [start, stop).
+"""
 
-from Waven import WaveletGenerator as wg
-from Waven import Analysis_Utils as au
-from Waven import LoadPinkNoise as lpn
-from Waven import zebraGUI as ui
-import numpy as np
-import gc
-import os   
-
-from pathlib import Path
-# from pynwb import NWBHDF5IO
-import numpy as np
-import matplotlib.pyplot as plt
-from dandi import dandiapi, download
-import os   
-import pandas as pd
-from scipy.signal import medfilt
-from scipy.interpolate import interp1d
-from pynwb import NWBHDF5IO
-
-from tqdm import tqdm
-
-import pickle
-
-import sys
-sys.path.append('..')
-import utils
-
-
-from numba import njit, typed
-from waven_settings import *
-# the SLAP2 branch reuses the gap handling already written for the Siegle maps
-# (drop_missing_samples / min_samples_for / window_means) rather than growing a
-# second convention for the same blanking periods
-import rf_siegle_ophys as siegle
-import h5py
-import json
 import hashlib
+import json
+import os
+from pathlib import Path
+from typing import Any, Dict, Iterable, Literal, NamedTuple, NoReturn, Optional, Sequence, Tuple, Union
+
+import h5py
 import numpy as np
-from typing import Dict, Any, Tuple
-import time
+import pandas as pd
+from tqdm import tqdm
+from Waven import Analysis_Utils as au
+from Waven import WaveletGenerator as wg
+
+import waven_settings as settings
 
 # Fewest imaged movie frames a SLAP2 (delay, duration) cell must retain before
-# the correlation is worth running at all. A Zebra repeat is ~1800 frames and a
-# session images roughly a third of it, so anything near this floor means the
-# window landed almost entirely in the blanking gaps.
+# the correlation is worth running at all. A Zebra repeat is 9000 frames, of
+# which ~97 % are imaged, so this floor only catches a broken session.
 MIN_COVERED_FRAMES = 300
 
+# Fraction of a SLAP2 response window that must be imaged for its movie frame to
+# be kept.
+MIN_COVERAGE = 0.95
+
+# SLAP2 pauses ~0.59 s between imaging bouts. That pause lies between two valid
+# samples, so without this cap it would count as imaged. Normal steps are
+# ~5 ms; an interval longer than GAP_FACTOR x the median step is a pause and
+# does not count. Same rule as NWBStream.slap2_segments() and the deconvolution.
+GAP_FACTOR = 5
 
 
-def create_gabor_library(xs, ys, thetas, sigmas, offsets, frequencies,
-                                 library_dir: str = library_path,
-                                 registry_name: str = "filter_registry.json",
-                                 overwrite: bool = False) -> Path:
-    """
-    Creates a filter library or loads it, if it already exists with the same parameters. 
-    Existing libraries and their parameteres are tracked in a JSON registry file. 
+def create_gabor_library(xs: Sequence[int], 
+                         ys: Sequence[int], 
+                         thetas: Sequence[float], 
+                         sigmas: Sequence[float], 
+                         offsets: Sequence[float], 
+                         frequencies: Sequence[float],
+                         library_dir: str = settings.library_path,
+                         registry_name: str = "filter_registry.json",
+                         overwrite: bool = False
+                        ) -> Path:
+    """Creates a Gabor filter library, or reuses an existing one.
 
-    Parameters
-    ----------
-    library_dir :
-        directory to save libraries and registry.
-    registry_name :
-        filename of the json registry (inside library_dir).
-    overwrite :
-        if True and a matching file exists, recreate and overwrite it.
+    The filter parameters are serialized to JSON and hashed (SHA-1, first 10
+    hex characters). The hash is the library id and is part of the file name
+    (``gabor_filter_library_{hash}.npy``). Libraries and their parameters are
+    tracked in a JSON registry inside ``library_dir``. If the registry already
+    holds an entry with identical parameters and its file exists, that file is
+    returned without recomputing.
 
-    Returns
-    -------
-    library_path : 
-        Path to library
+    Args:
+        xs: Filter center positions along x, in stimulus pixels.
+        ys: Filter center positions along y, in stimulus pixels.
+        thetas: Filter orientations.
+        sigmas: Gaussian envelope widths, in pixels.
+        offsets: Filter phase offsets, in degrees. Converted to radians
+            before the library is built.
+        frequencies: Spatial frequencies, in cycles per pixel.
+        library_dir: Directory in which the library and the registry are
+            stored. Created if missing.
+        registry_name: File name of the JSON registry inside ``library_dir``.
+        overwrite: If True, recompute and overwrite the library file even if
+            a matching one exists.
+
+    Returns:
+        Path to the ``.npy`` library file. For an existing library this is
+        the path stored in the registry, resolved against the registry
+        directory if relative.
     """
     lib_dir = Path(library_dir)
     lib_dir.mkdir(parents=True, exist_ok=True)
@@ -123,13 +120,13 @@ def create_gabor_library(xs, ys, thetas, sigmas, offsets, frequencies,
             # else: file missing or overwrite requested -> break and recreate below
             break
 
-    # create library with user-provided function
-    lib = wg.makeFilterLibrary2(xs, ys, thetas, sigmas, np.deg2rad(offsets), frequencies) # Note: Converting offsets to radians here is not very beautiful, but allow only minor mixes to prior analysis
+    # offsets are given in degrees (see waven_settings) but Waven needs radians;
+    # converting here keeps the degree values, and so the library id, unchanged
+    lib = wg.makeFilterLibrary2(xs, ys, thetas, sigmas, np.deg2rad(offsets), frequencies)
     if not isinstance(lib, np.ndarray):
         lib = np.asarray(lib)
 
     # save compressed
-    # np.savez_compressed(file_path, library=lib)
     np.save(file_path, lib)
 
     # add/update registry entry
@@ -149,44 +146,81 @@ def create_gabor_library(xs, ys, thetas, sigmas, offsets, frequencies,
     return file_path
 
 
-# def create_gabor_library():
-#     # create a new gabor library
-#     path_library = os.path.join(lib_path, '/filter_library')
-#     os.makedirs(path_library, exist_ok=True)
-#     path_save = os.path.join(, filename)
-#     if not os.path.exists(path_save):
-#         freq=True
-#         L = wg.makeFilterLibrary2(xs, ys, thetas, sigmas, offsets, frequencies)
-#         np.save(path_save, L)
-#         lib_path=path_save
+def get_downsampled_video_path(movie_path: Union[str, Path] = settings.movpath) -> Path:
+    """Returns the path of the downsampled stimulus file for a movie.
+
+    The file lives next to the movie and is named
+    ``{movie_stem}_downsampled__{ny}_{nx}.npy``, with ``ny`` and ``nx`` taken
+    from ``waven_settings``. This function only builds the path; it does not
+    check whether the file exists.
+
+    Args:
+        movie_path: Path to the stimulus video (.mp4). Defaults to the
+            ``movpath`` from ``waven_settings``.
+
+    Returns:
+        Path to the downsampled ``.npy`` file.
+    """
+    movie_path = Path(movie_path)
+    return movie_path.parent / f'{movie_path.stem}_downsampled__{settings.ny}_{settings.nx}.npy'
 
 
-def get_downsampled_video_path(movie_path=None):
-    """Path of the downsampled .npy for `movie_path` (defaults to the settings movpath)."""
-    movie_path = Path(movie_path if movie_path is not None else movpath)
-    return movie_path.parent / f'{movie_path.stem}_downsampled__{ny}_{nx}.npy'
+def downsample_video(movie_path: Union[str, Path] = settings.movpath, 
+                     chunk_size: int = 500
+                     ) -> NoReturn:
+    """Downsamples the stimulus video to the analysis grid, unless already done.
 
+    The video is cropped to ``analysis_coverage`` (given the full screen extent
+    in ``visual_coverage``) and resized to ``(ny, nx)`` by
+    ``wg.downsample_video_binary``, which saves the result as a boolean array
+    at the path given by ``get_downsampled_video_path``. If that file already
+    exists, nothing is done.
 
-def downsample_video(movie_path=None):
-    # downsample the video according to the analysis coverage
-    movie_path = Path(movie_path if movie_path is not None else movpath)
+    Args:
+        movie_path: Path to the stimulus video (.mp4). Defaults to the
+            ``movpath`` from ``waven_settings``.
+    """
+    movie_path = Path(movie_path)
     downsampled_path = get_downsampled_video_path(movie_path)
     if not os.path.exists(downsampled_path):
         wg.downsample_video_binary(os.path.abspath(movie_path),
-                                np.array(visual_coverage),
-                                np.array(analysis_coverage),
-                                shape=(ny, nx),
-                                chunk_size=500,
-                                ratios=(ratio_x, ratio_y)
+                                np.array(settings.visual_coverage),
+                                np.array(settings.analysis_coverage),
+                                shape=(settings.ny, settings.nx),
+                                chunk_size=chunk_size,
+                                ratios=(settings.ratio_x, settings.ratio_y)
                                 )
 
 
-def get_path_wavelet_decomposition(library_path=library_path, movpath=None):
-    # Video decomposition
+def get_path_wavelet_decomposition(library_path: Union[str, Path] = settings.library_path,
+                                   movpath: Union[str, Path] = settings.movpath
+                                   )->Path:
+    """Returns the folder of the wavelet decomposition, computing it if missing.
+
+    The folder is ``{movie_dir}/wavelet_decompositions/{movie_stem}/lib-{lib_id}``,
+    so a decomposition is specific to both the stimulus movie and the filter
+    library. ``lib_id`` is parsed from the library file name
+    (``gabor_filter_library_{lib_id}.npy``). The folder is created if needed.
+
+    For each phase (0 and 1), ``dwt_videodata_{phase}.npy`` is computed with
+    ``wg.waveletDecomposition`` unless it already exists. If the downsampled
+    movie is missing it is created first via ``downsample_video``.
+
+    Args:
+        library_path: Path to the Gabor library ``.npy`` file, as returned by
+            ``create_gabor_library``. Defaults to ``library_path`` from
+            ``waven_settings``.
+        movpath: Path to the stimulus video (.mp4). Defaults to ``movpath``
+            from ``waven_settings``.
+
+    Returns:
+        Path to the folder containing ``dwt_videodata_0.npy`` and
+        ``dwt_videodata_1.npy``.
+    """
     lib_name = os.path.basename(library_path)
     lib_id = lib_name.split('_')[-1].split('.')[0]
 
-    movpath = Path(movpath if movpath is not None else globals()['movpath'])
+    movpath = Path(movpath)
     print(movpath)
     # The movie stem has to be part of the path: several stimulus movies live in
     # the same folder (the zebra scale variants), and a decomposition is specific
@@ -209,25 +243,32 @@ def get_path_wavelet_decomposition(library_path=library_path, movpath=None):
                 downsample_video(movpath)
             videodata=np.load(video_path)
 
-            wg.waveletDecomposition(videodata=videodata, phase=phase, sigmas=sigmas, folder_path=path_decompositions, library_path=library_path)
+            wg.waveletDecomposition(videodata=videodata, phase=phase, sigmas=settings.sigmas, folder_path=path_decompositions, library_path=library_path)
 
     return path_decompositions
 
 
-# convert object-array of spike lists -> numba typed list of float64 arrays
-def make_typed_spike_list(spike_times_obj_array):
-    tl = typed.List()
-    for arr in spike_times_obj_array:
-        tl.append(np.asarray(arr, dtype=np.float64))
-    return tl
+def compute_neuron_rate_to_zebra_frames(frame_onset_times: np.ndarray,
+                                        spike_times_list: Sequence[np.ndarray],
+                                        delay: float = 0.0,
+                                        duration: float = 1/30
+                                        ) -> np.ndarray:
+    """Computes the firing rate of each unit in a window after each frame onset.
 
+    The window is half-open, ``[onset + delay, onset + delay + duration)``, the
+    convention of every window in this module. The continuous-signal
+    counterpart is ``average_signal_over_window``.
 
-def compute_neuron_rate_to_zebra_frames(frame_onset_times, spike_times_list, delay=0.0, duration=1/30):
+    Args:
+        frame_onset_times: Frame onset times in seconds, shape (n_frames,).
+        spike_times_list: One sorted array of spike times in seconds per unit, len (n_units).
+        delay: Offset of the window start from the frame onset, in seconds.
+        duration: Window length in seconds.
+
+    Returns:
+        Firing rates in Hz, shape (n_units, n_frames).
     """
-    Compute the firing rate of each neuron in spike_times_list for each frame defined by frame_onset_times, given a delay and duration.
-    Assumes that spike times are sorted. 
-    """
-    starts = frame_onset_times + delay      # vectorized, shape (num_trials,)
+    starts = frame_onset_times + delay     
     stops  = starts + duration
     num_units = len(spike_times_list)
     out = np.zeros((num_units, len(frame_onset_times)), dtype=np.float64)
@@ -238,38 +279,185 @@ def compute_neuron_rate_to_zebra_frames(frame_onset_times, spike_times_list, del
     return out
 
 
-def average_signal_over_window(times, signal, sample_times, duration):
+def pool_repeats(responses: np.ndarray,
+                 frame_index: np.ndarray,
+                 n_frames: int
+                 ) -> Tuple[np.ndarray, np.ndarray]:
+    """Averages the responses over repeats of the movie, one value per frame.
+
+    When every movie frame occurs equally often (once per repeat), the Pearson
+    correlation of a stimulus with the responses of all repeats stacked equals
+    its correlation with this average times ``scale``:
+
+        r_stacked = r_average * std(average) / std(all responses)
+
+    ``scale`` is one positive number per unit, so the best filter and the shape
+    of the map are those of the stacked repeats, while only one copy of the
+    stimulus is needed. With a single repeat in movie order, the average is the
+    response itself and ``scale`` is 1.
+
+    A frame missing from some repeats is averaged over the repeats it occurs
+    in. The Allen frame tables sometimes lack the last frame of a repeat (8999
+    instead of 9000 rows); the result then differs from exact stacking only by
+    the weight of that one frame.
+
+    Args:
+        responses: One response per frame onset, shape (n_units, n_onsets).
+        frame_index: Movie frame of each onset, shape (n_onsets,).
+        n_frames: Number of frames in the movie.
+
+    Returns:
+        mean_response: Average over repeats, shape (n_units, n_frames).
+        scale: Factor turning a correlation with ``mean_response`` into the
+            correlation on the stacked repeats, shape (n_units,). 0 for units
+            whose response never changes.
+
+    Raises:
+        ValueError: If a movie frame occurs in no repeat at all, or frame_index
+            points past the end of the movie.
     """
-    Average a continuously sampled signal over a window of length `duration`
-    starting at each time in `sample_times`.
+    frame_index = np.asarray(frame_index, dtype=int)
+    counts = np.bincount(frame_index, minlength=n_frames)
+    if len(counts) != n_frames or counts.min() == 0:
+        raise ValueError(
+            f'frame_index covers frames 0-{frame_index.max()}, and '
+            f'{int((counts[:n_frames] == 0).sum())} of the {n_frames} movie frames '
+            'never occur; every frame must occur in at least one repeat. The onsets '
+            'must be generated from this movie.')
+
+    # sort the onsets by frame, sum the repeats of each frame and divide by their number
+    order = np.argsort(frame_index, kind='stable')
+    first_of_frame = np.concatenate([[0], np.cumsum(counts)[:-1]])
+    sums = np.add.reduceat(responses[:, order], first_of_frame, axis=1)
+    mean_response = np.ascontiguousarray(sums / counts)
+
+    std_all = responses.std(axis=1)
+    scale = np.divide(mean_response.std(axis=1), std_all,
+                      out=np.zeros(len(responses)), where=std_all > 0)
+    return mean_response, scale
+
+
+class ZebraBlock(NamedTuple):
+    """The onsets of one ``full_pipeline`` call: one Zebra repeat or all of them.
+
+    Attributes:
+        trial_part: ``['trial_<i>']`` for a single repeat, ``['pooled_trials']`` when
+            pooled; the folder level and file-name part of its results.
+        frame_onset_times: Frame onset times in seconds, shape (n_onsets,).
+        frame_index: Movie frame of each onset, shape (n_onsets,).
+        attributes: ``pooled_repeats``, ``n_repeats``, ``trial`` and
+            ``nwb_trialnumber`` (both ``'pooled_trials'`` when pooled), for the
+            result files.
+    """
+    trial_part: list
+    frame_onset_times: np.ndarray
+    frame_index: np.ndarray
+    attributes: dict
+
+
+def zebra_blocks(zebra_frames: pd.DataFrame, per_trial: bool = False) -> list:
+    """Splits the Zebra frame table into the blocks ``full_pipeline`` is run on.
+
+    This is where pooled versus per trial is decided. ``full_pipeline`` pools
+    whatever repeats it is given, so pooling (the default) is one block holding
+    all repeats, and per trial is one block per repeat.
+
+    Args:
+        zebra_frames: One row per movie frame shown, with ``start_time``,
+            ``TrialNumber`` and the frame of the movie: ``frame`` (counted from
+            0, SLAP2's ``NWBStream.zebra_frame_times()``) or ``TrialInSequence``
+            (counted from 1, the ecephys and mesoscope ``zebra_df()``).
+        per_trial: One block per repeat instead of one pooled block.
+
+    Returns:
+        A list of ``ZebraBlock``, in the order the repeats were shown.
+    """
+    zebra_frames = zebra_frames.sort_values('start_time', kind='stable')
+    if 'frame' in zebra_frames:
+        frames = zebra_frames['frame'].to_numpy(dtype=int)
+    else:
+        frames = pd.to_numeric(zebra_frames['TrialInSequence']).to_numpy().astype(int) - 1
+    onsets = zebra_frames['start_time'].to_numpy(dtype=float)
+    trial_numbers = zebra_frames['TrialNumber'].to_numpy()
+    repeats = pd.unique(trial_numbers)
+
+    if not per_trial:
+        return [ZebraBlock(['pooled_trials'], onsets, frames,
+                           {'pooled_repeats': True, 'n_repeats': len(repeats),
+                            'trial': 'pooled_trials', 'nwb_trialnumber': 'pooled_trials'})]
+    blocks = []
+    for i_trial, trial_number in enumerate(repeats):
+        rows = trial_numbers == trial_number
+        blocks.append(ZebraBlock([f'trial_{i_trial}'], onsets[rows], frames[rows],
+                                 {'pooled_repeats': False, 'n_repeats': 1,
+                                  'trial': i_trial, 'nwb_trialnumber': str(trial_number)}))
+    return blocks
+
+
+def average_signal_over_window(times: np.ndarray,
+                               signal: np.ndarray,
+                               window_onset_times: np.ndarray,
+                               duration: float
+                               ) -> np.ndarray:
+    """Averages a continuously sampled signal over a window at each onset time.
 
     This is the continuous-signal counterpart of the spike-rate window in
-    compute_neuron_rate_to_zebra_frames: a negative duration averages backwards
-    from the sample time instead of forwards. The mean (rather than a sum over
-    `duration`) keeps the sign of the response independent of the sign of the
-    window, which matters because Pearson correlation is sign-sensitive.
+    ``compute_neuron_rate_to_zebra_frames``. For an onset ``t`` the window spans
+    ``t`` to ``t + duration``; a negative ``duration`` makes it extend backwards
+    from ``t``. The mean (rather than a sum over ``duration``) keeps the sign of
+    the response independent of the sign of the window, which matters because
+    Pearson correlation is sign-sensitive.
 
-    times        : (n_times,) sorted acquisition times of `signal`
-    signal       : (n_units, n_times) continuous signal, e.g. dF/F
-    sample_times : (n_samples,) window start times
-    duration     : window length in seconds; sign sets the direction
+    Windows are half-open, ``[min(t, t + duration), max(t, t + duration))``, the
+    convention of every window in this module (see also
+    ``compute_neuron_rate_to_zebra_frames`` and ``imaged_window_means``). Every
+    window averages at least one sample, so the output has no NaNs from empty
+    windows:
 
-    Returns (n_units, n_samples). Windows shorter than the sampling interval
-    fall back to the single sample they start on, so the output never contains
-    empty-window NaNs as long as every `sample_times` entry is in `times`.
+    * A window that contains no sample (``duration`` 0, a window between two
+      samples, or one entirely before the first or after the last sample) takes
+      the value of the first sample at or after its lower edge, or the last
+      sample if there is none. With ``duration`` 0 that is the sample at ``t``.
+    * A window that only partly overlaps the recording averages the samples
+      that exist.
+
+    Because the means are computed from a cumulative sum along time, a single NaN
+    would turn every window ending after it into NaN. ``signal`` must therefore
+    be NaN-free; this is asserted.
+
+    Args:
+        times: Acquisition times of ``signal`` in seconds, sorted ascending,
+            shape (n_times,).
+        signal: Continuous signal, e.g. dF/F, shape (n_units, n_times). Must not
+            contain NaNs.
+        window_onset_times: Window onset times in seconds, shape (n_windows,).
+        duration: Window length in seconds. The sign sets the direction.
+
+    Returns:
+        Window means, shape (n_units, n_windows).
+
+    Raises:
+        AssertionError: If ``signal`` contains NaNs.
     """
-    lo = np.minimum(sample_times, sample_times + duration)
-    hi = np.maximum(sample_times, sample_times + duration)
+    assert not np.isnan(signal).any(), "signal must not contain NaNs"
 
-    i_lo = np.searchsorted(times, lo, side='left')
-    i_hi = np.searchsorted(times, hi, side='right')
-    # a window is empty only if it falls between two samples; anchor it to the
-    # nearest preceding sample so every window averages at least one value
+    lo = np.minimum(window_onset_times, window_onset_times + duration)  # duration can be negative
+    hi = np.maximum(window_onset_times, window_onset_times + duration)
+
+    # [i_lo, i_hi) is the slice of samples with lo <= time < hi
+    i_lo = np.searchsorted(times, lo, side='left')    # first sample with time >= lo
+    i_hi = np.searchsorted(times, hi, side='left')    # first sample with time >= hi
+    # An empty window has i_hi == i_lo. Widen it to one sample, the one at i_lo
+    # (the first sample at or after the window start), so the mean is defined.
     i_hi = np.maximum(i_hi, i_lo + 1)
+    # Windows starting after the last sample have i_lo == n_times; clamp both
+    # indices so they select the last sample.
     i_lo = np.minimum(i_lo, signal.shape[1] - 1)
     i_hi = np.minimum(i_hi, signal.shape[1])
 
-    # cumulative sums turn the per-window means into two gathers
+    # csum[:, k] is the sum of the first k samples (csum[:, 0] == 0), so the sum
+    # over samples [i_lo, i_hi) is csum[:, i_hi] - csum[:, i_lo]. This turns
+    # every window mean into two column gathers instead of a loop over windows.
     csum = np.zeros((signal.shape[0], signal.shape[1] + 1), dtype=np.float64)
     np.cumsum(signal, axis=1, dtype=np.float64, out=csum[:, 1:])
 
@@ -277,118 +465,158 @@ def average_signal_over_window(times, signal, sample_times, duration):
     return (csum[:, i_hi] - csum[:, i_lo]) / counts
 
 
-def remove_bout_means(times, signal, bout_bounds):
-    """Subtract each acquisition bout's own mean from every unit.
+def imaged_time(times: np.ndarray,
+                valid: np.ndarray,
+                starts: np.ndarray,
+                stops: np.ndarray
+                ) -> np.ndarray:
+    """Time that was actually imaged inside each window [start, stop).
+    Relevant for SLAP2; also used by the two-photon Gabor maps (rf_gabors).
 
-    SLAP2 records in ~30 s bouts separated by blanking periods, and the dF/F
-    baseline is not guaranteed to return to the same level after a gap. Left in,
-    that step change is a slow signal spanning whole bouts, and it correlates
-    with whatever the stimulus happens to do slowly over the same stretch.
-    Centring each bout removes it while leaving the within-bout modulation - the
-    part that carries the receptive field - untouched.
+    The imaged time is the sum of the intervals between consecutive samples
+    that are both valid (non-NaN). An interval only counts with the part that
+    lies inside the window, and an interval longer than GAP_FACTOR x the median
+    step is a pause between imaging bouts and does not count at all.
 
-    times       : (n_times,) sorted acquisition times
-    signal      : (n_units, n_times)
-    bout_bounds : (n_bouts, 2) array of (start_time, stop_time), e.g. the
-                  start_time/stop_time columns of NWBStream.slap2_segments()
+    Args:
+        times: Sample times in seconds, sorted ascending, shape (n_times,).
+        valid: True where the sample holds data, shape (n_times,).
+        starts: Window starts in seconds, shape (n_windows,).
+        stops: Window stops in seconds, shape (n_windows,).
 
-    Returns a new (n_units, n_times) array; `signal` is not modified.
+    Returns:
+        Imaged time in seconds per window, shape (n_windows,).
     """
-    out = np.array(signal, dtype=np.float64, copy=True)
-    for lo, hi in np.asarray(bout_bounds, dtype=float):
-        m = (times >= lo) & (times <= hi)
-        if m.any():
-            out[:, m] -= out[:, m].mean(axis=1, keepdims=True)
-    return out
+    step = np.diff(times)
+    counts = valid[:-1] & valid[1:] & (step <= GAP_FACTOR * np.median(step))
+    # imaged time from the first sample up to each sample; np.interp places the
+    # window edges inside their intervals, which clips the intervals to the window
+    imaged_before = np.concatenate([[0.0], np.cumsum(np.where(counts, step, 0.0))])
+    return np.interp(stops, times, imaged_before) - np.interp(starts, times, imaged_before)
 
 
-def compute_slap2_response_to_zebra_frames(times, signal, frame_onset_times,
-                                           delay=0.0, duration=1/30,
-                                           min_coverage=siegle.MIN_COVERAGE):
-    """Mean dF/F per movie frame, dropping frames that were not imaged.
+def imaged_window_means(times: np.ndarray,
+                        signal: np.ndarray,
+                        starts: np.ndarray,
+                        stops: np.ndarray,
+                        min_coverage: float = MIN_COVERAGE
+                        ) -> Tuple[np.ndarray, np.ndarray]:
+    """Mean of each trace over each window [start, stop), if the window was imaged.
 
-    The counterpart of compute_neuron_rate_to_zebra_frames for SLAP2. SLAP2
-    samples at ~200 Hz against a 30 Hz movie, so - unlike the mesoscope - there
-    are several samples per frame and the resampling runs frame-first: one
-    response per movie frame, averaged over [onset + delay, onset + delay +
-    duration).
+    A window counts as imaged if at least ``min_coverage`` of its time was
+    imaged (see ``imaged_time``) and it holds at least one valid sample. NaN
+    samples inside an imaged window are left out of its mean.
 
-    The catch is that imaging is not continuous, so most frames of a session
-    have no samples at all. average_signal_over_window deliberately never
-    returns NaN: it anchors an empty window to the nearest preceding sample.
-    That is right for a continuously sampled mesoscope and wrong here, where it
-    would fill an un-imaged frame with a value from before the gap. So coverage
-    is tested first and uncovered frames are dropped from the design matrix
-    entirely, rather than being filled in.
+    Args:
+        times: Sample times in seconds, sorted ascending, shape (n_times,).
+        signal: Traces, e.g. dF/F or events, shape (n_units, n_times). May
+            contain NaN; a sample counts as valid only if no unit is NaN.
+        starts: Window starts in seconds, shape (n_windows,).
+        stops: Window stops in seconds, shape (n_windows,).
+        min_coverage: Fraction of the window's time that must be imaged.
 
-    times            : (n_times,) sorted acquisition times
-    signal           : (n_units, n_times) dF/F, already free of NaN samples
-    frame_onset_times: (n_frames,) movie frame onsets
-    duration         : window length in seconds; sign sets the direction, as in
-                       average_signal_over_window
+    Returns:
+        mean_responses: Mean per window, NaN where the window was not imaged,
+            shape (n_units, n_windows).
+        covered: True for the imaged windows, shape (n_windows,).
+    """
+    valid = np.isfinite(signal).all(axis=0)
 
-    Returns (responses, covered):
-        responses : (n_units, covered.sum()) mean dF/F per retained frame
-        covered   : (n_frames,) bool mask, to apply to the stimulus rows
+    # number of valid samples and their sum in [start, stop), from cumulative sums
+    i_lo = np.searchsorted(times, starts, side='left')
+    i_hi = np.searchsorted(times, stops, side='left')
+    n_valid = np.concatenate([[0], np.cumsum(valid)])
+    n_window = n_valid[i_hi] - n_valid[i_lo]
+    csum = np.zeros((signal.shape[0], signal.shape[1] + 1))
+    np.cumsum(np.where(valid, signal, 0.0), axis=1, out=csum[:, 1:])
+
+    covered = (imaged_time(times, valid, starts, stops) >= min_coverage * (stops - starts)) & (n_window > 0)
+
+    mean_responses = np.full((signal.shape[0], len(starts)), np.nan)
+    mean_responses[:, covered] = ((csum[:, i_hi[covered]] - csum[:, i_lo[covered]])
+                                  / n_window[covered])
+    return mean_responses, covered
+
+
+def compute_slap2_response_to_zebra_frames(times: np.ndarray,
+                                           signal: np.ndarray,
+                                           frame_onset_times: np.ndarray,
+                                           delay: float = 0.0,
+                                           duration: float = 1/30,
+                                           min_coverage: float = MIN_COVERAGE
+                                           ) -> Tuple[np.ndarray, np.ndarray]:
+    """Mean response per movie frame, keeping only frames that were imaged.
+
+    The counterpart of ``compute_neuron_rate_to_zebra_frames`` for SLAP2. SLAP2
+    samples at ~200 Hz against a 30 Hz movie, so there are several samples per
+    frame and the response of a frame is the mean over its window
+    ``[onset + delay, onset + delay + duration)``.
+
+    Imaging is not continuous: it pauses between bouts and some stretches are
+    NaN. A frame is kept only if at least ``min_coverage`` of its window was
+    imaged (see ``imaged_window_means``); the other frames are dropped from
+    stimulus and response alike rather than filled in. NaN samples within a kept
+    window are left out of its mean.
+
+    Args:
+        times: Sample times in seconds, sorted ascending, shape (n_times,).
+        signal: Traces, e.g. dF/F or events, shape (n_units, n_times). May
+            contain NaN; a sample counts as imaged only if no unit is NaN.
+        frame_onset_times: Movie frame onsets in seconds, shape (n_frames,).
+        delay: Offset of the window start from the frame onset, in seconds.
+        duration: Window length in seconds. The sign sets the direction.
+        min_coverage: Fraction of the window's time that must be imaged.
+
+    Returns:
+        mean_responses: Mean response per kept frame, shape (n_units, n_kept).
+        covered: True for the kept frames, shape (n_frames,), to select the
+            matching stimulus rows.
     """
     starts = np.asarray(frame_onset_times, dtype=float) + delay
-    lo = np.minimum(starts, starts + duration)
+    lo = np.minimum(starts, starts + duration) # relevant, because duration can be negative
     hi = np.maximum(starts, starts + duration)
 
-    min_samples = siegle.min_samples_for(times, abs(duration), min_coverage)
-    resp = siegle.window_means(signal, times, lo, hi, min_samples=min_samples)
-
-    # window_means blanks a whole column at once when a window is undersampled
-    covered = np.isfinite(resp).all(axis=0)
-    return resp[:, covered], covered
+    mean_responses, covered = imaged_window_means(times, signal, lo, hi, min_coverage)
+    return mean_responses[:, covered], covered
 
 
-# def compute_mean_signal_to_zebra_frames(frame_onset_times, signal, delay=0.0, duration=1/30):
-#     starts = frame_onset_times + delay      # vectorized, shape (num_trials,)
-#     stops  = starts + duration
+def save_results(rfs: Sequence[np.ndarray],
+                 unit_ids: Iterable[Union[int, str]],
+                 results_path: Union[str, Path] = './',
+                 results_filename: str = '',
+                 attributes: Dict[str, Any] = {}
+                 ) -> Path:
+    """Saves the receptive-field results of one run to an HDF5 file.
 
-#     num_units = len(signal)
-#     out = np.zeros((num_units, len(frame_onset_times)), dtype=np.float64)
-#     times = signal.columns.to_numpy()
-#     idx_starts = np.searchsorted(times, starts)
-#     idx_stops = np.searchsorted(times, stops)
+    The file contains:
+    * root attributes: all entries of ``attributes``
+    * ``unit_ids``: shape (n_units,)
+    * ``correlation_matrix``: ``rfs[0]`` as float16, shape (n_units, nx, ny, n_thetas, n_sigmas, n_frequencies)
+    * ``best_gabor_params_idx``: ``rfs[1]``, best [x, y, theta, sigma, frequency] indices, shape (5, n_units)
+    * ``best_gabor_params_degree``: ``rfs[2]``, best parameters in visual degrees, shape (4, n_units)
+    * ``abs_max_value``: ``rfs[3]``, peak correlation per unit, shape (n_units,)
 
-#     signals = signal.to_numpy() # (n_units, n_times)
+    Args:
+        rfs: Four arrays in the order (correlation matrix, best Gabor parameter
+            indices, best Gabor parameters in degrees, absolute maximum
+            values), as returned by the waven analysis.
+        unit_ids: Unit identifiers, one per unit, in the same order as
+            the first axis of ``rfs[0]``.
+        results_path: Directory to save into. Created, including parents, if
+            missing.
+        results_filename: File name inside ``results_path``. ``.h5`` is
+            appended if missing.
+        attributes: Metadata stored as HDF5 root attributes, e.g. delay,
+            duration, sigmas, thetas and frequencies. Values must be types
+            h5py can store as attributes.
 
-#     out = np.array([np.mean(signals[:, s:e], axis=1) for s,e in zip(idx_starts, idx_stops)]).T # (n_units, n_frame_onset_times)
-#     return out
+    Returns:
+        Path to the saved ``.h5`` file.
 
-# @njit
-# def compute_neuron_rate_to_zebra_frames(frame_onset_times, spike_times_list, delay=0.0, duration=1/30):
-#     num_units = len(spike_times_list)
-#     num_trials = len(frame_onset_times)
-#     out = np.zeros((num_units, num_trials), dtype=np.float64)
-#     # out = np.zeros((num_trials, num_units), dtype=np.float64)
-
-
-#     for u in range(num_units):
-#         unit_spike_times = spike_times_list[u]
-#         for i in range(num_trials):
-#             start_time = frame_onset_times[i] + delay
-#             # stop_time  = frame_offset_times[i] + delay
-#             stop_time  = start_time + duration
-#             rate = np.sum((unit_spike_times >= start_time) & (unit_spike_times < stop_time)) / (stop_time - start_time)
-#             out[u, i] = rate
-
-#     return out
-
-
-def save_results(rfs,
-                     unit_names_list,
-                    #  delay,
-                    #  duration,
-                    #  sigmas,
-                    #  thetas,
-                    #  frequencies,
-                     results_path='./',
-                     results_filename='',
-                     attributes: Dict[str, Any] = {}
-                     ):
+    Raises:
+        Exception: Any error while writing is printed and re-raised after the
+            temporary file is removed.
+    """
     import tempfile
 
     results_path = Path(results_path)
@@ -411,7 +639,7 @@ def save_results(rfs,
             for k, v in attributes.items():
                 hf.attrs[k] = v
 
-            hf.create_dataset('unit_ids', data=list(unit_names_list))
+            hf.create_dataset('unit_ids', data=list(unit_ids))
             hf.create_dataset('correlation_matrix', data=rfs[0].astype(np.float16), compression='gzip', compression_opts=4, dtype=np.float16)
             hf.create_dataset('best_gabor_params_idx', data=rfs[1])
             hf.create_dataset('best_gabor_params_degree', data=rfs[2])
@@ -428,7 +656,24 @@ def save_results(rfs,
     return outpath
 
 
-def subsample_wavelet_responses(wavelets_complex, xis, yis):
+def subsample_wavelet_responses(wavelets_complex: np.ndarray,
+                                xis: Sequence[int],
+                                yis: Sequence[int]) -> np.ndarray:
+    """Selects a sub-grid of filter positions from a wavelet decomposition.
+
+    The output keeps every position ``(x, y)`` with ``x`` in ``xis`` and ``y`` in
+    ``yis``. The new axes 1 and 2 follow the order of ``xis`` and ``yis``.
+
+    Args:
+        wavelets_complex: Decomposition with shape (n_frames, nx, ny, n_thetas,
+            n_sigmas, n_frequencies).
+        xis: Indices along axis 1 (x) to keep. Converted with ``int``.
+        yis: Indices along axis 2 (y) to keep. Converted with ``int``.
+
+    Returns:
+        Array of shape (n_frames, len(xis), len(yis), n_thetas, n_sigmas,
+        n_frequencies).
+    """
 
     wavelets_complex_subsampled = np.zeros((wavelets_complex.shape[0], len(xis), len(yis), wavelets_complex.shape[3], wavelets_complex.shape[4], wavelets_complex.shape[5]))
     for i, x_i in enumerate(tqdm(xis)):
@@ -438,7 +683,32 @@ def subsample_wavelet_responses(wavelets_complex, xis, yis):
     return wavelets_complex_subsampled
 
 
-def load_phase_dependent_wavelet_decompositions(path_decompositions, phase, xis=[], yis=[]):
+def load_phase_dependent_wavelet_decompositions(path_decompositions: Union[str, Path],
+                                                phase: Union[int, str],
+                                                xis: Sequence[int] = (),
+                                                yis: Sequence[int] = ()) -> np.ndarray:
+    """Loads the wavelet decomposition of one filter phase.
+
+    Reads ``dwt_videodata_{phase}.npy`` from ``path_decompositions`` fully into
+    memory. The file is not created here; it comes from
+    ``get_path_wavelet_decomposition``. If both ``xis`` and ``yis`` are
+    non-empty, the result is reduced with ``subsample_wavelet_responses``.
+
+    Args:
+        path_decompositions: Folder containing the decomposition files, as
+            returned by ``get_path_wavelet_decomposition``.
+        phase: Filter phase, ``0`` or ``1``. Only used in the file name.
+        xis: Indices along the x axis to keep. If empty, nothing is subsampled.
+        yis: Indices along the y axis to keep. If empty, nothing is subsampled.
+
+    Returns:
+        Decomposition with shape (n_frames, nx, ny, n_thetas, n_sigmas,
+        n_frequencies), or (n_frames, len(xis), len(yis), n_thetas, n_sigmas,
+        n_frequencies) if subsampled.
+
+    Raises:
+        FileNotFoundError: If ``dwt_videodata_{phase}.npy`` does not exist.
+    """
 
     file_path = os.path.join(path_decompositions, f'dwt_videodata_{phase}.npy')
 
@@ -450,35 +720,54 @@ def load_phase_dependent_wavelet_decompositions(path_decompositions, phase, xis=
     if len(xis) > 0 and len(yis) > 0:
         wavelet = subsample_wavelet_responses(wavelet, xis, yis)
 
-    # stack phase 0 and 1 into a new phase dimension: result shape will be
-    # (n_frames, n_phases=2, Nx, Ny, Ntheta, Nsigma, Nfreq, Noffset, ...)
-    # combined = np.stack((wavelet_0, wavelet_1), axis=-1)
-
     return wavelet
 
 
-def load_complex_wavelet_decomposition(path_decompositions, xis=[], yis=[]):
+def load_complex_wavelet_decomposition(path_decompositions: Union[str, Path],
+                                       xis: Sequence[int] = (),
+                                       yis: Sequence[int] = ()) -> np.ndarray:
+    """Loads the phase-invariant wavelet energy, computing it on first use.
 
-    pc = os.path.join(path_decompositions, 'dwt_videodata_c.npy')
-    if not os.path.exists(pc):
+    The "complex" response is the sum of the squared phase-0 and phase-1
+    responses, ``a0**2 + a1**2``, which does not depend on the filter phase. It
+    is a real float32 array, not complex-valued. It is cached as
+    ``dwt_videodata_c.npy`` in ``path_decompositions``.
+
+    If the cache is missing, it is computed from ``dwt_videodata_0.npy`` and
+    ``dwt_videodata_1.npy`` in chunks of 512 frames via memory maps, so the full
+    arrays are never held in memory at once. An existing cache is reused as is
+    and is not checked against the two phase files. After that the cache is
+    loaded fully into memory and, if both ``xis`` and ``yis`` are non-empty,
+    reduced with ``subsample_wavelet_responses``.
+
+    Args:
+        path_decompositions: Folder containing the phase decompositions, as
+            returned by ``get_path_wavelet_decomposition``.
+        xis: Indices along the x axis to keep. If empty, nothing is subsampled.
+        yis: Indices along the y axis to keep. If empty, nothing is subsampled.
+
+    Returns:
+        Wavelet energy with shape (n_frames, nx, ny, n_thetas, n_sigmas,
+        n_frequencies), or (n_frames, len(xis), len(yis), n_thetas, n_sigmas,
+        n_frequencies) if subsampled. The subsampled array is float64.
+    """
+
+    path_complex = os.path.join(path_decompositions, 'dwt_videodata_c.npy')
+    if not os.path.exists(path_complex):
         # Compute wavelet_c in chunks and avoid loading full arrays into RAM.
-        p0 = os.path.join(path_decompositions, 'dwt_videodata_0.npy')
-        p1 = os.path.join(path_decompositions, 'dwt_videodata_1.npy')
+        path_0 = os.path.join(path_decompositions, 'dwt_videodata_0.npy')
+        path_1 = os.path.join(path_decompositions, 'dwt_videodata_1.npy')
 
         # open memmaps to read shapes (these do not load the whole file)
-        wavelet_0_mm = np.load(p0, mmap_mode='r')
-        wavelet_1_mm = np.load(p1, mmap_mode='r')
+        wavelet_0_mm = np.load(path_0, mmap_mode='r')
+        wavelet_1_mm = np.load(path_1, mmap_mode='r')
 
         n_frames = wavelet_0_mm.shape[0]
         frame_shape = wavelet_0_mm.shape[1:]  # (Nx, Ny, Ntheta, Nsigma, Nfreq, Noffset) or similar
         dtype = np.float32
 
         # prepare an on-disk memmap for the computed magnitude (wavelet_c)
-        c_path = os.path.join(path_decompositions, 'dwt_videodata_c.npy')
-        # remove existing file if present to ensure open_memmap can create cleanly
-        if os.path.exists(c_path):
-            os.remove(c_path)
-        wavelet_c_mm = np.lib.format.open_memmap(c_path, mode='w+', dtype=dtype, shape=(n_frames, *frame_shape))
+        wavelet_c_mm = np.lib.format.open_memmap(path_complex, mode='w+', dtype=dtype, shape=(n_frames, *frame_shape))
 
         chunk_frames = 512  # adjust if you want larger/smaller chunks
 
@@ -496,70 +785,152 @@ def load_complex_wavelet_decomposition(path_decompositions, xis=[], yis=[]):
 
             # free local refs for this iteration
             del a0, a1, c_chunk
-            torch.cuda.empty_cache()
 
         # close/delete temporary memmap references to free resources
         del wavelet_0_mm, wavelet_1_mm, wavelet_c_mm
 
-    print(f"Loading precomputed wavelet_c from {pc}")
-    wavelet_c = np.load(pc)
+    print(f"Loading precomputed wavelet_c from {path_complex}")
+    wavelet_c = np.load(path_complex)
 
     if len(xis) > 0 and len(yis) > 0:
         wavelet_c = subsample_wavelet_responses(wavelet_c, xis, yis)
 
-    # add a new axis for phase to match expected shape (n_frames, Nx, Ny, Ntheta, Nsigma, Nfreq, Noffset, n_phases) in au.PearsonCorrelationPinkNoise()
-    # wavelet_c = wavelet_c[..., np.newaxis]  
-
     return wavelet_c
 
 
-def full_pipeline(frame_onset_times,
-                #   frame_offset_times,
-                  spike_times_list,
-                  delays,
-                  durations,
-                  unit_names_list,
-                  xis=[],
-                  yis=[],
-                  results_path='./',
-                  results_filename='',
-                  attributes={},
-                  recompute=False,
-                  phase='complex',
-                  input_type='spiketimes',
-                  movie_path=None,
-                  frame_index=None,
-                  bout_bounds=None,
-                  min_coverage=siegle.MIN_COVERAGE
-                  ):
-    """
-    movie_path: stimulus movie to correlate against. Defaults to the `movpath`
-    from waven_settings; pass it explicitly when a session shows more than one
-    movie (e.g. the zebra scale variants), so that each gets its own
-    downsampling and wavelet decomposition.
+def full_pipeline(frame_onset_times: np.ndarray,
+                  activity: Union[Sequence[np.ndarray], pd.DataFrame],
+                  delays: Union[float, Sequence[float], np.ndarray],
+                  durations: Union[float, Sequence[float], np.ndarray],
+                  unit_ids: Iterable[Union[int, str]],
+                  xis: Sequence[int] = (),
+                  yis: Sequence[int] = (),
+                  results_path: Union[str, Path] = './',
+                  results_filename: str = '',
+                  attributes: Dict[str, Any] = {},
+                  recompute: bool = False,
+                  phase: Literal['complex', '0', '1'] = 'complex',
+                  input_type: Literal['ecephys', 'mesoscope', 'slap2'] = 'ecephys',
+                  movie_path: Optional[Union[str, Path]] = None,
+                  frame_index: Optional[Union[Sequence[int], np.ndarray]] = None,
+                  min_coverage: float = MIN_COVERAGE
+                  ) -> Path:
+    """Maps receptive fields by correlating neural responses with Gabor wavelet energy.
 
-    frame_index: (n_onsets,) row index into the wavelet decomposition for each
-    entry of `frame_onset_times`. Required for input_type='slap2', where the
-    onsets pool several repeats of the movie and so cannot be matched to the
-    decomposition by position - the same stimulus row recurs on every repeat.
+    Runs the full waven analysis for one recording. The setup steps are
+    cached on disk and shared across calls: load or create the Gabor library,
+    downsample the stimulus movie, and wavelet-decompose it (see
+    ``create_gabor_library``, ``downsample_video`` and
+    ``get_path_wavelet_decomposition``). The decomposition is then loaded and
+    optionally subsampled in space. For every combination of ``delays`` and
+    ``durations``, the neural responses are resampled onto the movie frames
+    and correlated with the decomposition by ``au.PearsonCorrelationPinkNoise``.
+    The result of each (delay, duration) combination is saved with
+    ``save_results`` to its own HDF5 file.
 
-    bout_bounds: (n_bouts, 2) array of (start, stop) acquisition times, used by
-    input_type='slap2' to centre each imaging bout separately; see
-    remove_bout_means. Pass None to skip.
+    Pooled or per trial: ``full_pipeline`` pools whatever repeats of the movie
+    it is given. To get one result set per repeat, call it once per repeat;
+    ``zebra_blocks`` builds the onsets for either case and is what the
+    compute_waven_pipeline*.py drivers use (pooled by default, ``--per-trial``).
 
-    min_coverage: fraction of a response window that must actually be sampled
-    for the corresponding movie frame to be kept (input_type='slap2' only).
+    The three ``input_type`` values differ in how responses are matched to
+    movie frames:
+
+    * ``'ecephys'``: ``activity`` holds sorted spike times per unit.
+      The response is the firing rate in the window after each onset (see
+      ``compute_neuron_rate_to_zebra_frames``). Repeats of the movie are
+      averaged per frame and the correlation is rescaled, which gives exactly
+      the correlation on the stacked repeats (see ``pool_repeats``).
+    * ``'mesoscope'``: ``activity`` is a DataFrame of dF/F with ROIs
+      in rows and sample times in columns. The ~10 Hz samples are slower than
+      the movie, so each sample is attributed to the last frame whose onset lies
+      before ``sample time - delay``. Samples that do not fall on a frame (before
+      the first onset, after the last frame, or in a pause between repeats) are
+      dropped from stimulus and response alike. The response is the dF/F
+      averaged over ``duration`` from the sample (see
+      ``average_signal_over_window``). Repeats are stacked.
+    * ``'slap2'``: ``activity`` is a DataFrame of dF/F with ROIs in rows
+      and sample times in columns. SLAP2 samples faster than the movie, so there is one response per movie frame
+      (``compute_slap2_response_to_zebra_frames``). Frames that are not
+      sufficiently imaged are dropped from stimulus and response alike, and
+      repeats are stacked. A
+      (delay, duration) combination with fewer than ``MIN_COVERED_FRAMES``
+      frames left is skipped without writing a file.
+
+    Results are written to ``{results_path}/lib_{lib_id}/``, with the file name
+    ``{stem}__lib_{lib_id}__delay_{delay:.4f}__dur_{duration:.4f}.h5``, where ``stem`` is
+    ``results_filename`` without its extension. If ``results_filename`` is empty,
+    the file name starts at ``lib_{lib_id}``. An existing file for a combination
+    is skipped unless ``recompute`` is True. A file that cannot be opened, e.g.
+    left behind by a killed run, is deleted and recomputed.
+
+    The following attributes are added to the HDF5 attributes: library_id,
+    delay, duration, sigmas, thetas, frequencies, phase, num_units, num_frames
+    and movie. For ``'slap2'`` also: n_frames_covered, n_frames_total,
+    frac_frames_covered and min_coverage.
+
+    Args:
+        frame_onset_times: Onset time of each stimulus frame in seconds, sorted
+            ascending, shape (n_onsets,). Either one repeat of the movie or
+            several repeats pooled, matched to movie frames through
+            ``frame_index``.
+        activity: Neural activity of each unit. For ``'ecephys'``, one
+            sorted array of spike times in seconds per unit. For
+            ``'mesoscope'`` and ``'slap2'``, a DataFrame with ROIs in rows and
+            sample times in seconds as columns (dF/F or events).
+        delays: Delay(s) between frame onset and start of the response window,
+            in seconds. A scalar is treated as a single value.
+        durations: Length(s) of the response window in seconds. A scalar is
+            treated as a single value. Every delay is combined with every
+            duration.
+        unit_ids: Unit identifiers, one per unit, saved as ``unit_ids``.
+        xis: Indices along the x axis of the decomposition to keep. If either
+            ``xis`` or ``yis`` is empty, all positions are used. See
+            ``subsample_wavelet_responses``.
+        yis: Indices along the y axis to keep.
+        results_path: Base directory for the results. The ``lib_{lib_id}``
+            subdirectory is created inside it.
+        results_filename: Prefix for the result file names; an extension is
+            ignored.
+        attributes: Metadata stored as HDF5 attributes in every result file.
+            Updated in place with the attributes listed above, so it is
+            modified for the caller.
+        recompute: If True, recompute and overwrite existing result files.
+        phase: Which decomposition to use. ``'complex'`` is the phase-invariant
+            energy; ``'0'`` and ``'1'`` are the individual filter phases. See
+            ``load_complex_wavelet_decomposition``.
+        input_type: How ``activity`` is interpreted, see above.
+        movie_path: Stimulus movie to correlate against. Defaults to the
+            ``movpath`` from ``waven_settings``; pass it explicitly when a
+            session shows more than one movie (e.g. the zebra scale variants),
+            so that each gets its own downsampling and wavelet decomposition.
+        frame_index: Movie frame (row of the decomposition) of each entry of
+            ``frame_onset_times``, shape (n_onsets,). Needed when the onsets
+            pool several repeats, because the same frame recurs on every
+            repeat. None means one repeat in movie order (0, 1, 2, ...).
+        min_coverage: Fraction of a response window's time that must be imaged
+            for the corresponding movie frame to be kept (``'slap2'`` only).
+
+    Returns:
+        The directory containing the result files, ``{results_path}/lib_{lib_id}``.
+
+    Raises:
+        AssertionError: If ``phase`` is not ``'complex'``, ``'0'`` or ``'1'``.
+        ValueError: If ``input_type`` is unknown, or if ``frame_index`` has a
+            different length than ``frame_onset_times`` or points past the end
+            of the decomposition. For ``'ecephys'``, if a movie frame occurs
+            in no repeat (see ``pool_repeats``).
     """
 
     # ensure delays and durations are numpy 1D arrays of floats (support scalar input)
     delays = np.atleast_1d(np.asarray(delays, dtype=float))
     durations = np.atleast_1d(np.asarray(durations, dtype=float))
 
-    movie_path = Path(movie_path) if movie_path is not None else Path(movpath)
+    movie_path = Path(movie_path) if movie_path is not None else Path(settings.movpath)
 
     # create_gabor_library()
     print('Creating/Loading Gabor Filter Library...')
-    library_path = create_gabor_library(xs, ys, thetas, sigmas, offsets, frequencies)
+    library_path = create_gabor_library(settings.xs, settings.ys, settings.thetas, settings.sigmas, settings.offsets, settings.frequencies)
     lib_id = os.path.basename(library_path).split('_')[-1].split('.')[0]
 
     print('Downsampling Video...')
@@ -567,7 +938,6 @@ def full_pipeline(frame_onset_times,
 
     print('Wavelet Decomposition...')
     path_decompositions =  get_path_wavelet_decomposition(library_path=library_path, movpath=movie_path)
-    # path_decompositions =  wavelet_decomposition_gpu(library_path=library_path, device='cuda')
 
     print('Loading and Subsampling Wavelet Decompositions...')
     assert phase in ['complex', '0', '1'], "phase parameter must be 'complex', '0', or '1'"
@@ -576,65 +946,53 @@ def full_pipeline(frame_onset_times,
     else:
         wavelet_decomposition = load_complex_wavelet_decomposition(path_decompositions, xis, yis)
 
-    # Stimulus and response must be sampled at the same timepoints. For spike
-    # times, one frame onset corresponds to exactly one movie frame, so a length
-    # mismatch means the onsets were built for a different movie than the one
-    # decomposed here - silent garbage rather than an error further down.
-    if input_type == 'spiketimes' and len(frame_onset_times) != wavelet_decomposition.shape[0]:
+    # Checking the frame index and reading the traces does not depend on delay
+    # or duration, so it is done once rather than per grid cell. A frame index
+    # past the end of the decomposition means the onsets were built for another
+    # movie - silent garbage rather than an error further down.
+    frame_onset_times = np.asarray(frame_onset_times, dtype=float)
+    if frame_index is None:
+        frame_index = np.arange(len(frame_onset_times))
+    frame_index = np.asarray(frame_index, dtype=int)
+    if len(frame_index) != len(frame_onset_times):
         raise ValueError(
-            f'{len(frame_onset_times)} frame onset times but {wavelet_decomposition.shape[0]} '
-            f'frames in the decomposition of {movie_path.name}. '
+            f'{len(frame_index)} frame indices but {len(frame_onset_times)} '
+            'frame onset times; they must describe the same rows.'
+        )
+    if frame_index.max() >= wavelet_decomposition.shape[0]:
+        raise ValueError(
+            f'frame_index reaches {frame_index.max()} but the decomposition of '
+            f'{movie_path.name} has only {wavelet_decomposition.shape[0]} frames. '
             'The onsets must be generated from this movie.'
         )
 
-    # Dropping blanked samples and centring the bouts does not depend on delay
-    # or duration, so it is done once rather than per grid cell.
+    if input_type == 'mesoscope':
+        frame_period = float(np.median(np.diff(frame_onset_times)))
+
     if input_type == 'slap2':
-        if frame_index is None:
-            raise ValueError(
-                "input_type='slap2' needs frame_index: the onsets pool several "
-                'repeats of the movie, so the matching stimulus row cannot be '
-                "inferred from position. Use the 'frame' column of "
-                'NWBStream.zebra_frame_times().'
-            )
-        frame_index = np.asarray(frame_index, dtype=int)
-        if len(frame_index) != len(frame_onset_times):
-            raise ValueError(
-                f'{len(frame_index)} frame indices but {len(frame_onset_times)} '
-                'frame onset times; they must describe the same rows.'
-            )
-        if frame_index.max() >= wavelet_decomposition.shape[0]:
-            raise ValueError(
-                f'frame_index reaches {frame_index.max()} but the decomposition of '
-                f'{movie_path.name} has only {wavelet_decomposition.shape[0]} frames. '
-                'The onsets must be generated from this movie.'
-            )
-
-        slap2_times = np.asarray(spike_times_list.columns.to_numpy(), dtype=float)
-        slap2_dff = spike_times_list.to_numpy(dtype=np.float64)
-        n_raw = slap2_dff.shape[1]
-        slap2_dff, slap2_times = siegle.drop_missing_samples(slap2_dff, slap2_times)
+        # NaN samples stay in: compute_slap2_response_to_zebra_frames counts
+        # them as not imaged and leaves them out of the means
+        slap2_times = np.asarray(activity.columns.to_numpy(), dtype=float)
+        slap2_dff = activity.to_numpy(dtype=np.float64)
+        n_blanked = (~np.isfinite(slap2_dff).all(axis=0)).sum()
         print(f'{slap2_dff.shape[0]} ROIs, {slap2_dff.shape[1]} samples '
-              f'({n_raw - slap2_dff.shape[1]} blanked), '
-              f'{len(frame_onset_times)} movie frames')
+              f'({n_blanked} blanked), {len(frame_onset_times)} movie frames')
 
-        if bout_bounds is not None:
-            slap2_dff = remove_bout_means(slap2_times, slap2_dff, bout_bounds)
-            print(f'Centred {len(np.asarray(bout_bounds))} acquisition bouts')
-
-    results_path = Path(results_path) / f'lib_{lib_id}'
+    lib_dir = Path(results_path) / f'lib_{lib_id}'
 
     for delay in delays:
         for duration in durations:
 
-            # Check whether results already exist for this parameter combination
-            # Skip if yes and recompute is False, else compute and save results
+            # Skip a grid cell whose result file exists, unless recompute is True.
+            # Delay and duration go into the name with four decimals, so float noise
+            # (0.15000000000000002) does not end up in the file name.
             stem = Path(results_filename).stem if results_filename else ''
-            filename = f'{stem}__lib_{lib_id}__delay_{delay}__dur_{duration}.h5' if stem else f'lib_{lib_id}__delay_{delay}__dur_{duration}.h5'
-            filepath = results_path/filename
+            name = f'lib_{lib_id}__delay_{delay:.4f}__dur_{duration:.4f}.h5'
+            filename = f'{stem}__{name}' if stem else name
+            filepath = lib_dir / filename
 
-            # Due to timeout and memory constraints it happened that some runs were killed mid-way, leaving behind corrupt result files.
-            # There we check here, wheter previous results exist and can be opened, before deciding to skip or recompute.
+            # Runs killed by the wall time or memory limit can leave a corrupt file
+            # behind, so an existing file is only skipped if it can be opened.
             if filepath.exists() and not recompute:
                 try:
                     with h5py.File(filepath, 'r'):
@@ -645,34 +1003,41 @@ def full_pipeline(frame_onset_times,
                     print(f"WARNING: corrupt results file at {filepath} — recomputing.")    
                     filepath.unlink()
 
-            print(f'Computing Neuron Rates to Zebra Frames for delay {delay}, duration {duration} and phase {phase}...')
-            # spike_times_list = make_typed_spike_list(spike_times_list)
-            if input_type == 'spiketimes':
+            print(f'Computing responses to the Zebra frames for delay {delay:.4f}, duration {duration:.4f} and phase {phase}...')
+            if input_type == 'ecephys':
                 stim = wavelet_decomposition
-                neuron_rate_to_zebra_frames = compute_neuron_rate_to_zebra_frames(frame_onset_times, spike_times_list, delay, duration)
+                rates = compute_neuron_rate_to_zebra_frames(frame_onset_times, activity, delay, duration)
+                # one value per movie frame, averaged over repeats; `scale` is
+                # applied to the correlations below (see pool_repeats)
+                responses, scale = pool_repeats(
+                    rates, frame_index, wavelet_decomposition.shape[0])
             elif input_type == 'mesoscope':
                 # mesoscope data is a DataFrame with time in columns and ROIs in rows
-                times = spike_times_list.columns.to_numpy()
-                dff = spike_times_list.to_numpy()  # (n_rois, n_times)
-                # we have to keep in mind that the mesoscope sampling rate is ~10Hz, so larger then the zebra frame rate
-                # Therefore only select the frame immediately before a mesoscope data point and drop the rest.
-                # The response at time t is attributed to the frame shown `delay` seconds earlier.
+                times = activity.columns.to_numpy()
+                dff = activity.to_numpy()  # (n_rois, n_times)
+                # The mesoscope samples at ~10 Hz, slower than the 30 Hz movie, so
+                # each sample takes the frame shown `delay` seconds before it and the
+                # frames in between are not used.
                 t_lookup = times - delay
-                keep = (t_lookup > frame_onset_times[0]) & (t_lookup < frame_onset_times[-1])
-                # index of the last frame whose onset is strictly before t_lookup
-                idxs = np.searchsorted(frame_onset_times, t_lookup[keep], side='left') - 1
+                # index of the last onset strictly before t_lookup
+                idxs = np.searchsorted(frame_onset_times, t_lookup, side='left') - 1
+                # keep a sample only if that frame was still on screen: after the
+                # first onset and less than 1.5 frames after the matched onset, which
+                # drops samples after the last frame and in pauses between repeats
+                keep = (idxs >= 0) & (
+                    t_lookup - frame_onset_times[np.maximum(idxs, 0)] < 1.5 * frame_period)
                 # stimulus and response must be restricted to the *same* samples,
                 # otherwise the two matrices have different numbers of timepoints
-                stim = wavelet_decomposition[idxs]
+                stim = wavelet_decomposition[frame_index[idxs[keep]]]
                 # average dF/F over `duration` from each retained sample; windows
                 # shorter than the ~0.1 s mesoscope interval reduce to that sample
-                neuron_rate_to_zebra_frames = average_signal_over_window(times, dff, times[keep], duration)
+                responses = average_signal_over_window(times, dff, times[keep], duration)
             elif input_type == 'slap2':
                 # SLAP2 samples ~6x faster than the movie, so the resampling runs
                 # the other way round from the mesoscope: one response per movie
                 # frame, with the frames that fall in a blanking gap dropped from
                 # stimulus and response alike.
-                neuron_rate_to_zebra_frames, covered = compute_slap2_response_to_zebra_frames(
+                responses, covered = compute_slap2_response_to_zebra_frames(
                     slap2_times, slap2_dff, frame_onset_times, delay, duration,
                     min_coverage=min_coverage)
                 # The decomposition is ~100 GB at the current settings and the
@@ -697,38 +1062,42 @@ def full_pipeline(frame_onset_times,
             else:
                 raise ValueError(
                     f'unknown input_type {input_type!r}; expected one of '
-                    "'spiketimes', 'mesoscope', 'slap2'"
+                    "'ecephys', 'mesoscope', 'slap2'"
                 )
 
 
             print('Running Correlation Analysis...')
-            ## runs correlation analysis
-            rfs = au.PearsonCorrelationPinkNoise(#stim=wavelet_c.reshape(wavelet_c.shape[0], -1),
-                                                    stim=stim,
-                                                    resp=neuron_rate_to_zebra_frames.T,
+            rfs = au.PearsonCorrelationPinkNoise(stim=stim,
+                                                    resp=responses.T,
                                                     neuron_pos=np.zeros((1,2)),  # dummy value for neuron_pos,
                                                     nx=stim.shape[1],
                                                     ny=stim.shape[2],
-                                                    ns=ns,
-                                                    n_frequencies=len(frequencies),
+                                                    ns=settings.ns,
+                                                    n_frequencies=len(settings.frequencies),
                                                     n_phases=stim.shape[-1],  # use actual number of phases from loaded decomposition
-                                                    visual_coverage=analysis_coverage, 
-                                                    screen_ratio=screen_ratio, 
-                                                    sigmas=sigmas_deg,
+                                                    visual_coverage=settings.analysis_coverage, 
+                                                    screen_ratio=settings.screen_ratio, 
+                                                    sigmas=settings.sigmas_deg,
                                                     plotting=False,
-                                                    n_thetas=n_thetas
+                                                    n_thetas=settings.n_thetas
                                                     )
+            if input_type == 'ecephys':
+                # correlation with the average -> correlation on the stacked repeats;
+                # PearsonCorrelationPinkNoise returns a tuple, which cannot be assigned to
+                rfs = list(rfs)
+                rfs[0] *= scale.reshape(-1, *[1] * (rfs[0].ndim - 1))
+                rfs[3] *= scale
             
             # Add additional attributes
             add_to_attributes = {
                 "library_id": lib_id,
                 "delay": delay,
                 "duration": duration,
-                "sigmas": list(sigmas),
-                "thetas": list(thetas),
-                "frequencies": list(frequencies),
+                "sigmas": list(settings.sigmas),
+                "thetas": list(settings.thetas),
+                "frequencies": list(settings.frequencies),
                 "phase": phase,
-                "num_units": len(spike_times_list),
+                "num_units": len(activity),
                 "num_frames": stim.shape[0],
                 "movie": movie_path.name,
             }
@@ -740,21 +1109,15 @@ def full_pipeline(frame_onset_times,
                     "n_frames_total": int(covered.size),
                     "frac_frames_covered": float(covered.mean()),
                     "min_coverage": float(min_coverage),
-                    "bouts_centred": bout_bounds is not None,
                 })
             attributes.update(add_to_attributes)
 
             print('Saving Results...')
             outpath = save_results(rfs,
-                                    unit_names_list,
-                                    # delay,
-                                    # duration,
-                                    # sigmas,
-                                    # thetas,
-                                    # frequencies,
-                                    results_path=results_path,
+                                    unit_ids,
+                                    results_path=lib_dir,
                                     results_filename=filename,
                                     attributes=attributes
                                     )
-    return results_path
+    return lib_dir
     

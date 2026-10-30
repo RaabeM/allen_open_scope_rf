@@ -1,6 +1,6 @@
 # allen_open_scope — Wavelet RF Mapping
 
-Receptive field mapping pipeline applied to [Allen Open Scope](https://dandiarchive.org/dandiset/001637) electrophysiology data. Zebra noise (pink noise video) stimuli are decomposed by a Gabor wavelet filter bank, and the resulting wavelet responses are cross-correlated with single-unit spike rates to estimate receptive field maps.
+Receptive field mapping of the Zebra noise movie in [Allen Open Scope](https://dandiarchive.org/dandiset/001637) sessions of three recording modalities: **ecephys** (spike times), **mesoscope** (dF/F or deconvolved events) and **SLAP2** (dF/F or deconvolved events, green and red channel). The movie is decomposed by a Gabor wavelet filter bank, and every unit's response is cross-correlated with the decomposition to give one receptive field map per unit, filter and (delay, duration).
 
 ## Setup
 
@@ -11,76 +11,81 @@ conda env create -f envs/waven_dandi.yml
 conda activate waven_dandi
 ```
 
-This installs the `waven` package directly from the `develop` branch of [github.com/RaabeM/waven](https://github.com/RaabeM/waven).
+This installs the `waven` package from the `allen_open_scope` branch of [github.com/RaabeM/waven](https://github.com/RaabeM/waven).
 
-### 2. Configure paths
+### 2. Configure paths and the filter bank
 
-Open `waven_settings.py` and update the two path entries to point to your data:
+All analysis parameters live in `scripts/waven_settings.py`; its docstring explains each one. Set at least:
 
 ```python
-"Movie Path": "/path/to/zebra_allen_screen_tscale_30_scale_10.mp4",
-"Library Path": "/path/to/filter_libraries/",
+movpath = '/path/to/zebra_allen_screen_tscale_30_scale_10.mp4'
+library_path = '../../waven/filter_libraries/'
 ```
-- `Movie Path`: Path to Zebra stimulus, can be downloaded from Open-Scope-Repo [Link](https://github.com/AllenNeuralDynamics/openscope-community-predictive-processing/blob/main/code/stimulus-control/src/Mindscope/movies/zebra_allen_screen_tscale_30_scale_10.mp4)
-- `Library Path`: Path to where the wavelet library will be saved
 
+- `movpath`: the Zebra stimulus, available from the [Open Scope repository](https://github.com/AllenNeuralDynamics/openscope-community-predictive-processing/blob/main/code/stimulus-control/src/Mindscope/movies/zebra_allen_screen_tscale_30_scale_10.mp4).
+- `library_path`: where the Gabor filter libraries are stored.
+
+Spatial frequencies are in cycles per pixel of the downsampled movie and must stay below 0.5 (Nyquist). Changing the filter bank creates a new library id and a new results folder.
 
 ## Running the pipeline
-**Caution:** Under the current settings loading the filter libraries takes **256 GB of RAM!** I am working on making it more handy.
 
-### Wavelet RF mapping (main pipeline)
-
-```bash
-python compute_waven_pipeline.py ProbeB \***
-    --nwb-path /data/sub-820454.nwb \
-    --results-dir /results/waven/
-```
-
-- `probe` (positional, default `ProbeB`): probe to process
-- `--nwb-path`: path to the NWB file
-- `--results-dir`: root directory for output HDF5 files
-
-Results are saved to `<results-dir>/<probe>/lib_<hash>/` as one `.h5` file per (delay, duration) combination.
-
-#### Output format
-
-Each result file is an HDF5 with the following structure:
-
-```
-/attrs:  sigmas, thetas, frequencies, delay, duration, session, probe
-/unit_ids                — (n_units,) unit identifiers
-/correlation_matrix      — (n_units, nx, ny, n_thetas, ns, n_freqs)  gzip-4
-/best_gabor_params_idx   — (5, n_units)
-/best_gabor_params_degree — (4, n_units)
-/abs_max_value           — (n_units,)
-```
-
-### Optimize parameters
-
-After running the pipeline across the full delay × duration grid:
+Run the scripts from `scripts/`. One driver per modality; each streams the session from DANDI by default (`--local` reads a file from disk instead):
 
 ```bash
-python optimize_waven_parameters.py /results/waven/ProbeB/lib_<hash>/ \
-    --output /results/waven/ProbeB/lib_<hash>/best_params.h5
+python compute_waven_pipeline_ecephys.py   --nwb-path <asset path> --results-dir <root> --probe-idx 0
+python compute_waven_pipeline_mesoscope.py --nwb-path <asset path> --results-dir <root> --plane-idx 4 --signal events
+python compute_waven_pipeline_slap2.py     --nwb-path <asset path> --results-dir <root> --dmd DMD1 --channel green
 ```
 
-#### Output format
+All three share `--optimized-dir`, `--phases`, `--per-trial`, `--recompute`, `--no-optimize`, `--dandiset-id` and `--local`; see `--help`. Zebra repeats are **pooled** into one map by default; `--per-trial` gives one map per repeat.
+
+**Memory:** one phase of the wavelet decomposition (~54 GB at the current settings) is loaded whole, and the correlation adds a copy of similar size, so plan for 300–350 GB.
+
+### Result layout
+
+```
+<results-dir>/<session>/<signal>/<group>/<pooled_trials|trial_<i>>/phase_<p>/lib_<id>/
+    lib_<id>__delay_<delay>__dur_<duration>.h5      one file per (delay, duration)
+<optimized-dir>/<session>/<signal>/
+    optimized__<session>__<group>__<pooled_trials|trial_<i>>__phase_<p>.{csv,h5}
+```
+
+`<signal>` is `spikes` for ecephys and `events` or `dff` for the imaging modalities; `<group>` is the probe, the imaging plane, or `<DMD>/<channel>`.
+
+### Per-(delay, duration) file
+
+```
+/attrs:  session, modality, signal, group, phase, delay, duration, library_id,
+         sigmas, thetas, frequencies, movie, pooled_repeats, n_repeats, trial, ...
+/unit_ids                 — (n_units,) unit identifiers
+/correlation_matrix       — (n_units, nx, ny, n_thetas, n_sigmas, n_frequencies)  float16, gzip-4
+/best_gabor_params_idx    — (5, n_units) best [x, y, theta, sigma, frequency] indices
+/best_gabor_params_degree — (4, n_units) best [x, y, theta, sigma] in visual degrees
+/abs_max_value            — (n_units,) peak |Pearson r|
+```
+
+### Optimized file (one row per unit)
+
+Each driver reduces its delay × duration grid with `optimize_waven_parameters.py` (also usable on its own: `python optimize_waven_parameters.py <lib_<id> folder> --output best.csv`):
 
 ```
 /unit_ids      — (n_units,) unit identifier strings
-/rf_maps       — (n_units, nx, ny)  float32  gzip-4  spatial RF map at best params
-/delay         — (n_units,)  optimal delay in seconds
-/duration      — (n_units,)  optimal duration in seconds
-/abs_max_value — (n_units,)  peak |Pearson r| across all (delay, duration, θ, σ, f)
-/x_deg         — (n_units,)  RF centre azimuth in visual degrees
-/y_deg         — (n_units,)  RF centre elevation in visual degrees
-/theta_deg     — (n_units,)  orientation in Waven's degree convention
-/theta_rad     — (n_units,)  orientation in radians
-/sigma_deg     — (n_units,)  Gabor σ in visual degrees
-/sigma         — (n_units,)  Gabor σ in pixels
-/frequency     — (n_units,)  spatial frequency in cycles/pixel
-/xi, /yi       — (n_units,)  grid indices of RF centre
-/theta_idx, /sigma_idx, /frequency_idx  — (n_units,)  grid indices of best params
-/lib_id        — (n_units,)  filter library hash string
-/source_file   — (n_units,)  path to the per-(delay, duration) source .h5
+/rf_maps       — (n_units, nx, ny)  RF map at the best filter
+/delay, /duration, /abs_max_value
+/x_deg, /y_deg — RF centre in visual degrees
+/theta_deg, /theta_rad — orientation
+/sigma_deg, /sigma     — Gabor size in visual degrees / pixels
+/frequency     — spatial frequency in cycles/pixel
+/xi, /yi, /theta_idx, /sigma_idx, /frequency_idx — grid indices of the best filter
+/lib_id, /source_file
 ```
+
+## Significance
+
+`compute_null_distribution_<modality>.py` builds a per-unit null of the sweep-wide maximum from circularly rolled responses (same pooling and grid as the driver), and `filter_significant_maps.py` turns observed maxima and nulls into per-unit p-values with Benjamini–Hochberg across units.
+
+## Local Gabor RFs
+
+`compute_rf_gabors_{ecephys,mesoscope,slap2}.py` map receptive fields from the local Gabor patches: the response to each presentation (spike rate, or the mean ΔF/F / event amplitude over a window) is tested for spatial structure with a permutation test, once per (delay, duration), and reduced to the best window per unit and orientation. The delay x duration grid and the window rule of each modality are those of its Zebra analysis (imported from `compute_waven_pipeline_<modality>.py`), so both stimuli are tested over the same windows. The shared code is `rf_gabors.py`. Like the waven drivers they stream from DANDI (`--local` reads from disk), pool the whole RF block by default (`--per-trial` scores its two halves at the pooled run's windows), skip existing files and refuse files computed on another unit list (`--recompute` replaces them). Results go to `<results-path>/<session>/<signal>/` below a modality root, as for the Zebra results: `gabors/<ecephys|mesoscope|slap2>/<session>/<spikes|dff|events>/`.
+
+`compute_gabor_unit_significance.py` adds a unit-level p-value after the full search (`p_value_gumbel`, a Gumbel fit to the studentized maximum over windows and orientations, see `gabor_significance.py`) and its BH q-value (`p_value_bh`) to the pooled optimized files in `--results-dir` (default `results/gabors/`), with the BH families of `filter_significant_maps.py`.

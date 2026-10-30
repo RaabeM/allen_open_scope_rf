@@ -1,5 +1,6 @@
-"""
-Optimize waven pipeline parameters per unit.
+# Author: Marcel C. Raabe
+# Date: 2026-10-29
+"""Optimize waven pipeline parameters per unit.
 
 Scans a directory tree of waven result .h5 files and, for each unit,
 identifies the (delay, duration, theta, sigma, frequency) combination
@@ -8,17 +9,15 @@ that maximises the peak Pearson correlation.
 Within each .h5 file the correlation matrix has already been reduced to
   abs_max_value[unit]          — peak |correlation| across x,y,θ,σ,f
   best_gabor_params_idx[:, u]  — argmax indices [xi, yi, θi, σi, fi]
-  best_gabor_params_degree[:, u] — best params in visual degrees [x, y, σ, f]
+  best_gabor_params_degree[:, u] — best params in visual degrees [x, y, θ, σ]
 
 So optimising over delay × duration amounts to picking the file with
 the highest abs_max_value for each unit and reading out its stored best
 gabor parameters.
 
-Usage
------
-  python optimize_waven_parameters.py <results_dir> [--output path/to/out.csv]
+Usage, from the command line or by calling optimize_parameters() directly:
 
-  or import and call optimize_parameters() directly.
+    python optimize_waven_parameters.py <results_dir> [--output path/to/out.csv]
 """
 
 from __future__ import annotations
@@ -43,6 +42,24 @@ def _parse_lib_id(filepath: Path) -> str:
         if part.startswith("lib_") or part.startswith("lib-"):
             return part.split("_", 1)[1].split("-", 1)[-1]
     return ""
+
+
+def read_null_sweep(null_path: str | Path) -> tuple[np.ndarray, np.ndarray]:
+    """The (delays, durations) grid a null-distribution file was built on.
+
+    compute_null_distribution_ecephys.py maximises each surrogate over a sweep that may be
+    a subset of this pipeline's own - e.g. every second delay. Its threshold
+    is only valid against an observed maximum taken over that same subset, so the
+    grid travels with the null file rather than being restated by hand.
+    """
+    with h5py.File(Path(null_path), "r") as hf:
+        return (np.asarray(hf.attrs["sweep_delays"], dtype=float),
+                np.asarray(hf.attrs["sweep_durations"], dtype=float))
+
+
+def _in_grid(value: float, grid: np.ndarray | None) -> bool:
+    """Whether `value` is in `grid`, tolerantly. No grid means no restriction."""
+    return grid is None or bool(np.any(np.isclose(value, grid)))
 
 
 def discover_files(results_dir: str | Path) -> list[Path]:
@@ -76,30 +93,44 @@ def optimize_parameters(
     all_values_path: str | Path | None = None,
     include_negative: bool = False,
     extract_tuning_curves: bool = False,
+    sweep_delays: np.ndarray | None = None,
+    sweep_durations: np.ndarray | None = None,
 ) -> pd.DataFrame:
-    """
-    Scan all waven result files under results_dir and return a DataFrame
-    with one row per unit containing the best parameters across all
-    (delay, duration) combinations.
+    """Picks, per unit, the best filter over all (delay, duration) result files.
 
-    Columns
-    -------
-    unit_id, delay, duration, lib_id,
-    abs_max_value,
-    x_deg, y_deg,           — RF centre in visual degrees
-    theta_deg,              — orientation in Waven's degree convention
-                              (0–225° for n_thetas=10; theta_rad is the
-                               canonical radian value from attrs)
-    sigma_deg,              — Gabor σ in visual degrees (2 * deg/pix * σ)
-    theta_rad,              — orientation in radians (from attrs lookup)
-    sigma,                  — Gabor σ in pixels (from attrs lookup)
-    frequency,              — spatial frequency in cycles/pixel (from attrs)
-    xi, yi, theta_idx, sigma_idx, frequency_idx,  — raw grid indices
-    source_file             — which .h5 file gave the best result
+    Scans every waven result file under ``results_dir`` and keeps, for each
+    unit, the file with the highest ``abs_max_value`` together with its stored
+    best filter.
 
-    A secondary CSV with columns (unit_id, delay, duration, abs_max_value) is
-    written to all_values_path (or <output_path stem>_all_values.csv when
-    output_path is given and all_values_path is None).
+    Args:
+        results_dir: Folder searched recursively for waven ``.h5`` files.
+        output_path: CSV to write the result to. An HDF5 file with the same
+            stem is written next to it. None writes nothing.
+        all_values_path: CSV for every (unit, delay, duration, abs_max_value);
+            defaults to ``<output_path stem>_all_values.csv``.
+        include_negative: Also use files with a negative delay or duration.
+        extract_tuning_curves: Add 1D tuning curves from each unit's best file.
+        sweep_delays: Restrict the maximum to these delays (e.g. a null's grid).
+            None uses every file found.
+        sweep_durations: Same for the durations.
+
+    Returns:
+        One row per unit with the columns:
+
+        * ``unit_id``, ``delay``, ``duration``, ``lib_id``, ``abs_max_value``
+        * ``x_deg``, ``y_deg``: RF centre in visual degrees
+        * ``theta_deg``: orientation in degrees, converted from ``theta_rad``
+          (not read from ``best_gabor_params_degree``, which is wrong in files
+          written before the Waven fix)
+        * ``sigma_deg``: Gabor size in visual degrees (2 * deg/pix * sigma)
+        * ``theta_rad``, ``sigma`` (pixels), ``frequency`` (cycles/pixel),
+          looked up from the file attributes
+        * ``xi``, ``yi``, ``theta_idx``, ``sigma_idx``, ``frequency_idx``: grid
+          indices of the best filter
+        * ``source_file``: the file that gave the best result
+
+    Raises:
+        FileNotFoundError: If no waven result file is found.
     """
     files = discover_files(results_dir)
     if not files:
@@ -109,6 +140,9 @@ def optimize_parameters(
 
     best: dict[str, dict] = {}
     all_rows: list[dict] = []
+    skipped_off_grid = 0
+    used_delays: set[float] = set()
+    used_durations: set[float] = set()
 
     for filepath in tqdm(files):
         lib_id = _parse_lib_id(filepath)
@@ -131,6 +165,16 @@ def optimize_parameters(
         if not include_negative and (delay < 0 or duration < 0):
             continue
 
+        # Restricting the maximum to the null's grid. Taking it over more sweep
+        # points than the surrogates saw inflates it relative to the threshold,
+        # which is anti-conservative - so this has to be skipped, not merely
+        # flagged.
+        if not (_in_grid(delay, sweep_delays) and _in_grid(duration, sweep_durations)):
+            skipped_off_grid += 1
+            continue
+        used_delays.add(delay)
+        used_durations.add(duration)
+
         for i, uid in enumerate(unit_ids):
             val = abs_max[i]
             all_rows.append({"unit_id": uid, "delay": delay, "duration": duration, "abs_max_value": val})
@@ -144,7 +188,7 @@ def optimize_parameters(
                     "abs_max_value": val,
                     "x_deg": best_deg[0, i],
                     "y_deg": best_deg[1, i],
-                    "theta_deg": best_deg[2, i],
+                    "theta_deg": float(np.degrees(thetas[ti])),
                     "sigma_deg": best_deg[3, i],
                     "xi": int(xi),
                     "yi": int(yi),
@@ -156,6 +200,23 @@ def optimize_parameters(
                     "frequency": float(frequencies[fi]),
                     "source_file": str(filepath),
                 }
+
+    if sweep_delays is not None or sweep_durations is not None:
+        print(f"Restricted to the null's sweep: {len(used_delays)} delays x "
+              f"{len(used_durations)} durations, {skipped_off_grid} files skipped")
+        # A grid point with no result file means the observed maximum is over a
+        # SMALLER family than the surrogates were - conservative rather than
+        # wrong, but it silently costs power and usually means the two runs were
+        # pointed at different sweeps.
+        for name, want, got in (("delays", sweep_delays, used_delays),
+                                ("durations", sweep_durations, used_durations)):
+            if want is None:
+                continue
+            missing = [float(v) for v in want
+                       if not (got and any(np.isclose(v, list(got))))]
+            if missing:
+                print(f"WARNING: no result files for {name} {missing}; the observed "
+                      "maximum spans fewer sweep points than the null does.")
 
     df = pd.DataFrame(list(best.values()))
     df = df.sort_values("unit_id").reset_index(drop=True)
@@ -199,23 +260,19 @@ def optimize_parameters(
 def load_rf_maps(
     best_params: str | Path | pd.DataFrame
 ) -> pd.DataFrame:
-    """
-    Attach the 2D RF correlation map to each unit in best_params.
+    """Attaches the 2D RF map at the best filter to each unit.
 
-    For every unit the function reads the slice
-        correlation_matrix[unit_row, :, :, theta_idx, sigma_idx, frequency_idx]
-    from its source .h5 file, giving the spatial RF map (nx × ny) at the
-    optimal orientation, scale, and frequency found by optimize_parameters.
+    For every unit, reads
+    ``correlation_matrix[unit_row, :, :, theta_idx, sigma_idx, frequency_idx]``
+    from its source file: the spatial map (nx x ny) at the orientation, size
+    and frequency found by ``optimize_parameters``.
 
-    Parameters
-    ----------
-    best_params :
-        Path to best_params.csv produced by optimize_parameters
+    Args:
+        best_params: Output of ``optimize_parameters``, as a DataFrame or the
+            path of its CSV.
 
-    Returns
-    -------
-    DataFrame identical to the input with one extra column:
-        rf_map  — list of (nx, ny) float32 arrays, one per unit
+    Returns:
+        The input with one extra column ``rf_map``: an (nx, ny) array per unit.
     """
     if isinstance(best_params, pd.DataFrame):
         df = best_params
@@ -316,19 +373,22 @@ def _extract_tuning_curves(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def save_rf_results(df: pd.DataFrame, output_path: str | Path) -> Path:
-    """
-    Save the DataFrame to a single HDF5 file.
+    """Saves the optimized results to one HDF5 file, atomically.
 
-    Layout
-    ------
-    /unit_ids          — (n_units,) unit identifier strings
-    /rf_maps           — (n_units, nx, ny) float32, gzip-compressed  [if present]
-    /tuning_azimuth    — (n_units, nx)       float32, gzip-compressed [if present]
-    /tuning_elevation  — (n_units, ny)       float32, gzip-compressed [if present]
-    /tuning_orientation— (n_units, n_thetas) float32, gzip-compressed [if present]
-    /tuning_size       — (n_units, ns)       float32, gzip-compressed [if present]
-    /tuning_frequency  — (n_units, n_freq)   float32, gzip-compressed [if present]
-    /<col>             — one dataset per scalar / string column
+    The file holds ``/unit_ids``, one dataset per scalar or string column, and,
+    when present, ``/rf_maps`` (n_units, nx, ny) and the tuning curves
+    ``/tuning_azimuth`` (n_units, nx), ``/tuning_elevation`` (n_units, ny),
+    ``/tuning_orientation`` (n_units, n_thetas), ``/tuning_size``
+    (n_units, ns) and ``/tuning_frequency`` (n_units, n_freq), all gzip-
+    compressed.
+
+    Args:
+        df: Output of ``optimize_parameters``, optionally with ``rf_map`` and
+            tuning-curve columns.
+        output_path: HDF5 file to write.
+
+    Returns:
+        The path written.
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -369,16 +429,16 @@ def save_rf_results(df: pd.DataFrame, output_path: str | Path) -> Path:
 
 
 def load_rf_results(path: str | Path) -> pd.DataFrame:
-    """
-    Load a file written by save_rf_results.
+    """Loads a file written by ``save_rf_results``.
 
-    Returns a DataFrame with scalar columns and, when present:
-      'rf_map'            — (nx, ny) float32 arrays
-      'tuning_azimuth'    — (nx,)       float32 arrays
-      'tuning_elevation'  — (ny,)       float32 arrays
-      'tuning_orientation'— (n_thetas,) float32 arrays
-      'tuning_size'       — (ns,)       float32 arrays
-      'tuning_frequency'  — (n_freq,)   float32 arrays
+    Args:
+        path: The HDF5 file.
+
+    Returns:
+        One row per unit with the scalar and string columns and, when present,
+        ``rf_map`` (an (nx, ny) array per unit) and the tuning curves
+        ``tuning_azimuth``, ``tuning_elevation``, ``tuning_orientation``,
+        ``tuning_size`` and ``tuning_frequency``.
     """
     path = Path(path)
     with h5py.File(path, "r") as hf:
@@ -442,14 +502,31 @@ def main():
         help="Extract 1D tuning curves (azimuth, elevation, orientation, size, frequency) "
              "and store them in the output HDF5. Skipped by default.",
     )
+    parser.add_argument(
+        "--sweep-from-null",
+        default=None,
+        help="Path to a null__lib_*.h5 from compute_null_distribution_ecephys.py. The "
+             "per-unit maximum is then taken only over that file's (delay, duration) "
+             "grid, so it spans the same test family the surrogates did. Without "
+             "this the maximum covers every result file present, which against a "
+             "thinned null is anti-conservative.",
+    )
     args = parser.parse_args()
+
+    sweep_delays = sweep_durations = None
+    if args.sweep_from_null:
+        sweep_delays, sweep_durations = read_null_sweep(args.sweep_from_null)
+        print(f"Matching the null's sweep from {args.sweep_from_null}:")
+        print(f"  delays    {sweep_delays}")
+        print(f"  durations {sweep_durations}")
 
     csv_out = args.output or str(Path(args.results_dir) / "best_params.csv")
     h5_out = str(Path(csv_out).with_suffix(".h5"))
 
     # optimize_parameters scans files, saves CSV + HDF5 (tuning curves optional)
     df = optimize_parameters(args.results_dir, csv_out, include_negative=args.include_negative,
-                             extract_tuning_curves=args.tuning_curves)
+                             extract_tuning_curves=args.tuning_curves,
+                             sweep_delays=sweep_delays, sweep_durations=sweep_durations)
     # load_rf_maps adds 2D spatial RF maps; save_rf_results writes the final HDF5
     df = load_rf_maps(df)
     save_rf_results(df, h5_out)

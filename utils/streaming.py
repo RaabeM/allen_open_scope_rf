@@ -1,3 +1,6 @@
+# Author: Marcel C. Raabe
+# Contributors: Lucas Rudelt
+# Date: 2026-10-29
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -73,20 +76,25 @@ class NWBStream:
 
     # --- Ecephys ---
 
-    def units_df(self, probe: str | None = None) -> pd.DataFrame:
+    def units_df(self, probe: str | None = None, include_spikes: bool = True) -> pd.DataFrame:
         """Units table as a DataFrame, optionally filtered to one probe.
 
         Avoids pynwb's to_dataframe() which triggers one HTTP request per
         HDF5 chunk for spike_times and per-unit DynamicTableRegion expansion
         for electrodes. Instead, reads both as single bulk h5py reads.
 
-        Adds a 'probe' column (electrode group_name) and, when the electrodes
-        table has it, a 'location' column — CCF structure acronym with
-        cortical layer suffix where applicable, e.g. 'VISp5'.
+        Adds ``probe`` (``device_name``), ``electrode_row``, and ``location`` — CCF
+        acronym at the unit's extremum channel (``extremum_channel_index`` with
+        per-probe offset into the stacked electrodes table). Decoded into
+        ``area``, ``layer``, ``group``, and ``tissue`` via :mod:`utils.ccf`.
 
-        probe: substring matched against electrode group_name, e.g. 'ProbeB'.
+        probe: substring matched against ``device_name``, e.g. 'ProbeB'.
+        include_spikes: if False, skip loading spike_times (fast anatomy-only).
         """
         _require_modality(self.modality, "ecephys", "units_df")
+        from .ccf import enrich_unit_locations
+        from .ecephys_io import unit_electrode_rows
+
         h5u = self._h5["units"]
 
         # --- scalar columns (small, one read each) ---
@@ -103,21 +111,18 @@ class NWBStream:
                 pass
         df = pd.DataFrame(data)
 
-        # --- probe / location columns: one bulk read of the electrodes table ---
-        elec_h5     = self.nwb.electrodes["group_name"].data.parent
-        group_names = np.array(elec_h5["group_name"].asstr()[:])
-        elec_flat   = h5u["electrodes"][:]
-        elec_bounds = np.concatenate([[0], h5u["electrodes_index"][:]])
-        df["probe"] = [
-            group_names[elec_flat[elec_bounds[i]:elec_bounds[i + 1]]][0]
-            for i in range(len(df))
-        ]
+        elec_h5 = self.nwb.electrodes["group_name"].data.parent
+        elrows = unit_electrode_rows(self._h5)
+        df["electrode_row"] = elrows
+        if "device_name" in df.columns:
+            df["probe"] = df["device_name"].astype(str)
+        else:
+            group_names = np.array(elec_h5["group_name"].asstr()[:])
+            df["probe"] = group_names[elrows]
         if "location" in elec_h5:
             locations = np.array(elec_h5["location"].asstr()[:])
-            df["location"] = [
-                locations[elec_flat[elec_bounds[i]:elec_bounds[i + 1]]][0]
-                for i in range(len(df))
-            ]
+            df["location"] = locations[elrows]
+            df = enrich_unit_locations(df)
 
         # --- probe filter before loading spike_times ---
         if probe is not None:
@@ -127,15 +132,108 @@ class NWBStream:
         orig_indices = df.index.tolist()
         df = df.reset_index(drop=True)
 
-        # --- spike_times: two bulk reads, reconstruct ragged array ---
-        spike_flat   = h5u["spike_times"][:]
-        spike_bounds = np.concatenate([[0], h5u["spike_times_index"][:]])
-        df["spike_times"] = [
-            spike_flat[spike_bounds[i]:spike_bounds[i + 1]]
-            for i in orig_indices
-        ]
+        if include_spikes:
+            spike_flat   = h5u["spike_times"][:]
+            spike_bounds = np.concatenate([[0], h5u["spike_times_index"][:]])
+            df["spike_times"] = [
+                spike_flat[spike_bounds[i]:spike_bounds[i + 1]]
+                for i in orig_indices
+            ]
 
         return df
+
+    # def units_df(self, probe: str | None = None) -> pd.DataFrame:
+    #     """Units table as a DataFrame, optionally filtered to one probe.
+
+    #     Avoids pynwb's to_dataframe() which triggers one HTTP request per
+    #     HDF5 chunk for spike_times and per-unit DynamicTableRegion expansion
+    #     for electrodes. Instead, reads both as single bulk h5py reads.
+
+    #     Adds a 'probe' column (electrode group_name) and, when the electrodes
+    #     table has it, a 'location' column — CCF structure acronym with
+    #     cortical layer suffix where applicable, e.g. 'VISp5'.
+
+    #     probe: substring matched against electrode group_name, e.g. 'ProbeB'.
+    #     """
+    #     _require_modality(self.modality, "ecephys", "units_df")
+    #     h5u = self._h5["units"]
+
+    #     # --- scalar columns (small, one read each) ---
+    #     skip = {"spike_times", "spike_times_index", "electrodes", "electrodes_index",
+    #             "waveform_mean", "waveform_sd", "waveform_mean_index", "waveform_sd_index"}
+    #     data = {}
+    #     for col in self.nwb.units.colnames:
+    #         if col in skip:
+    #             continue
+    #         try:
+    #             raw = h5u[col][:]
+    #             data[col] = raw.tolist() if hasattr(raw, "tolist") else list(raw)
+    #         except KeyError:
+    #             pass
+    #     df = pd.DataFrame(data)
+
+    #     # --- probe / location columns: one bulk read of the electrodes table ---
+    #     # A unit's 'electrodes' region spans its *whole probe's* electrode
+    #     # array, not just its own channel, so we must pick out the unit's
+    #     # peak channel (extremum_channel_index) rather than the first entry —
+    #     # otherwise every unit on a probe collapses onto the same electrode.
+    #     elec_h5     = self.nwb.electrodes["group_name"].data.parent
+    #     group_names = np.array(elec_h5["group_name"].asstr()[:])
+    #     elec_flat   = h5u["electrodes"][:]
+    #     elec_starts = np.concatenate([[0], h5u["electrodes_index"][:]])[:-1]
+    #     if "extremum_channel_index" in h5u:
+    #         peak_offset = h5u["extremum_channel_index"][:]
+    #     else:
+    #         peak_offset = np.zeros(len(df), dtype=int)
+    #     peak_elec = elec_flat[elec_starts + peak_offset]
+    #     df["probe"] = group_names[peak_elec]
+    #     if "location" in elec_h5:
+    #         locations = np.array(elec_h5["location"].asstr()[:])
+    #         df["location"] = locations[peak_elec]
+
+    #     # --- probe filter before loading spike_times ---
+    #     if probe is not None:
+    #         df = df[df["probe"].str.contains(probe, na=False)]
+
+    #     # preserve original row numbers before reset — used to index spike_bounds
+    #     orig_indices = df.index.tolist()
+    #     df = df.reset_index(drop=True)
+
+    #     # --- spike_times: two bulk reads, reconstruct ragged array ---
+    #     spike_flat   = h5u["spike_times"][:]
+    #     spike_bounds = np.concatenate([[0], h5u["spike_times_index"][:]])
+    #     df["spike_times"] = [
+    #         spike_flat[spike_bounds[i]:spike_bounds[i + 1]]
+    #         for i in orig_indices
+    #     ]
+
+    #     return df
+
+    def probes(self) -> list[str]:
+        """Probe names in the order units_df()['probe'].unique() gives, without reading spike times."""
+        _require_modality(self.modality, "ecephys", "probes")
+        h5u = self._h5["units"]
+        group_names = np.array(self.nwb.electrodes["group_name"].data.parent["group_name"].asstr()[:])
+        elec_flat = h5u["electrodes"][:]
+        first_elec = np.concatenate([[0], h5u["electrodes_index"][:-1]])
+        return list(pd.unique(group_names[elec_flat[first_elec]]))
+
+    def mesoscope_plane_areas(self) -> pd.DataFrame:
+        """One row per imaging plane: area and depth from optophysiology.location."""
+        _require_modality(self.modality, "mesoscope", "mesoscope_plane_areas")
+        from .ccf import parse_mesoscope_location
+
+        rows = []
+        opto = self._h5.get("general/optophysiology")
+        for plane in self.imaging_planes():
+            loc = ""
+            if opto is not None and plane in opto and "location" in opto[plane]:
+                raw = opto[plane]["location"][()]
+                loc = raw.decode() if isinstance(raw, bytes) else str(raw)
+            parsed = parse_mesoscope_location(loc, plane_fallback=plane)
+            rows.append(dict(plane=plane, area=parsed["area"], depth_um=parsed["depth_um"],
+                             location=loc))
+        return pd.DataFrame(rows)
 
     def zebra_df(self) -> pd.DataFrame:
         """Zebra noise stimulus presentation table (start_time, stop_time, ...).
@@ -336,7 +434,11 @@ class NWBStream:
         instead of one row per frame, so frame onsets are reconstructed by
         assuming a constant `fps` within each block. Columns: TrialNumber,
         frame, start_time, stop_time.
+
+        SLAP2 only: the ecephys and mesoscope zebra_df() already has one row per
+        frame, which this would turn into frame 0 for every row.
         """
+        _require_modality(self.modality, "slap2", "zebra_frame_times")
         blocks = self.zebra_df()
         out = []
         for _, b in blocks.iterrows():
@@ -402,6 +504,10 @@ class DandiSession:
             asset_id=asset_id,
         )
 
+    def open_path(self, asset_path: str) -> NWBStream:
+        """Stream an asset by its path in the dandiset, e.g. 'sub-830794/sub-830794_ses-..._ecephys.nwb'."""
+        return self.open(self._ds.get_asset_by_path(asset_path).identifier)
+
     def download(self, asset_id: str, dest: str | Path) -> Path:
         """Download a DANDI asset to a local file via the DANDI API. Returns the saved path."""
         dest = Path(dest)
@@ -425,6 +531,13 @@ class DandiSession:
 def open_nwb(asset_id: str, dandiset_id: str = DANDISET_ID) -> NWBStream:
     """Stream a DANDI NWB file by asset ID without downloading it."""
     return DandiSession(dandiset_id).open(asset_id)
+
+
+def open_session(nwb_path: str | Path, dandiset_id: str | None = None) -> NWBStream:
+    """Stream nwb_path as an asset path from dandiset_id, or open it from disk when dandiset_id is None."""
+    if dandiset_id is None:
+        return open_local(nwb_path)
+    return DandiSession(dandiset_id).open_path(str(nwb_path))
 
 
 def open_local(path: str | Path, asset_id: str = "") -> NWBStream:

@@ -25,4 +25,5 @@ dependencies:
       - torchvision
       - elephant
       - remfile
-      - git+https://github.com/RaabeM/waven.git@develop
+      - oasis-deconv
+      - git+https://github.com/RaabeM/waven.git@allen_open_scope

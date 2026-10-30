@@ -1,0 +1,40 @@
+# Data and results — never commit large binary/output files
+results/
+plots/
+*.zip
+*.sh
+
+# Not part of the RF analysis
+analysis/
+demos/
+notebooks/
+plotting/
+review_claude.md
+utils/utils.py
+scripts/compute_gabor_spike_count.py
+scripts/compute_rf_sta_zebra.py
+scripts/compute_waven_pipeline_prelim.py
+scripts/convert_results_to_half_precs.py
+scripts/download_session.py
+scripts/export_ephys_unit_areas.py
+scripts/oasis_deconvolve_slap2.py
+scripts/slap2_transmission_changes.py
+scripts/test_ephys_unit_areas.py
+scripts/waven_settings_backup.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*~
+
