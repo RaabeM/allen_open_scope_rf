@@ -1,6 +1,7 @@
-# allen_open_scope — Wavelet RF Mapping
+# [Allen Open Scope] Receptive Field Mapping
 
-Receptive field mapping of the Zebra noise movie in [Allen Open Scope](https://dandiarchive.org/dandiset/001637) sessions of three recording modalities: **ecephys** (spike times), **mesoscope** (dF/F or deconvolved events) and **SLAP2** (dF/F or deconvolved events, green and red channel). The movie is decomposed by a Gabor wavelet filter bank, and every unit's response is cross-correlated with the decomposition to give one receptive field map per unit, filter and (delay, duration).
+Standalone package of the receptive field mapping for the [Allen Open Scope P3 Data Release paper](https://github.com/AllenNeuralDynamics/openscope_p3_data_release_paper). It supports analyzsing all three recording modalities - **ecephys** (spike times), **mesoscope** (dF/F or deconvolved events) and **SLAP2** (dF/F or deconvolved events, green and red channel) - ,and Gabor and Zebra stimulus. 
+
 
 ## Setup
 
@@ -25,11 +26,10 @@ library_path = '../../waven/filter_libraries/'
 - `movpath`: the Zebra stimulus, available from the [Open Scope repository](https://github.com/AllenNeuralDynamics/openscope-community-predictive-processing/blob/main/code/stimulus-control/src/Mindscope/movies/zebra_allen_screen_tscale_30_scale_10.mp4).
 - `library_path`: where the Gabor filter libraries are stored.
 
-Spatial frequencies are in cycles per pixel of the downsampled movie and must stay below 0.5 (Nyquist). Changing the filter bank creates a new library id and a new results folder.
 
 ## Running the pipeline
 
-Run the scripts from `scripts/`. One driver per modality; each streams the session from DANDI by default (`--local` reads a file from disk instead):
+Run the scripts from `scripts/`. Each modality has its own driver; each streams the session from DANDI by default (`--local` reads a file from disk instead):
 
 ```bash
 python compute_waven_pipeline_ecephys.py   --nwb-path <asset path> --results-dir <root> --probe-idx 0
@@ -89,3 +89,21 @@ Each driver reduces its delay × duration grid with `optimize_waven_parameters.p
 `compute_rf_gabors_{ecephys,mesoscope,slap2}.py` map receptive fields from the local Gabor patches: the response to each presentation (spike rate, or the mean ΔF/F / event amplitude over a window) is tested for spatial structure with a permutation test, once per (delay, duration), and reduced to the best window per unit and orientation. The delay x duration grid and the window rule of each modality are those of its Zebra analysis (imported from `compute_waven_pipeline_<modality>.py`), so both stimuli are tested over the same windows. The shared code is `rf_gabors.py`. Like the waven drivers they stream from DANDI (`--local` reads from disk), pool the whole RF block by default (`--per-trial` scores its two halves at the pooled run's windows), skip existing files and refuse files computed on another unit list (`--recompute` replaces them). Results go to `<results-path>/<session>/<signal>/` below a modality root, as for the Zebra results: `gabors/<ecephys|mesoscope|slap2>/<session>/<spikes|dff|events>/`.
 
 `compute_gabor_unit_significance.py` adds a unit-level p-value after the full search (`p_value_gumbel`, a Gumbel fit to the studentized maximum over windows and orientations, see `gabor_significance.py`) and its BH q-value (`p_value_bh`) to the pooled optimized files in `--results-dir` (default `results/gabors/`), with the BH families of `filter_significant_maps.py`.
+
+## Data-release figures
+
+```bash
+python plotting/plot_data_release_panels.py
+```
+
+Example sessions: ecephys 830794, mesoscope 832700, SLAP2 829704. Figures go to `plots/data_release__*.png`. Everything is read from `results/`, which is not part of this repository, so compute these inputs first:
+
+1. **Zebra maps**, pooled: `results/zebra/optimized/<modality>/<session>/<signal>/optimized__<session>__<group>__pooled_trials__phase_0.h5`, from the waven drivers. The signal per modality is `ZEBRA_SIGNAL` in the script (ecephys `spikes`, mesoscope `events`, SLAP2 `dff`).
+2. **Zebra nulls** of the same signal, block and library: `results/zebra/nullresults/...`, from `compute_null_distribution_<modality>.py`. The script checks that each null's lag-0 maximum reproduces the map's `abs_max_value`.
+3. **Local Gabor maps**, pooled: `results/gabors/<modality>/<session>/<signal>/*__optimized.h5` (`spikes` for ecephys, `events` for imaging), from `compute_rf_gabors_<modality>.py`.
+4. **Gabor unit significance**: `compute_gabor_unit_significance.py`. Needed for the overlap, pie and Gaussian-summary panels.
+5. **Ephys areas**: `export_ephys_unit_areas.py` writes `results/ecephys/<session>/unit_areas.csv`, used to keep visual cortex layer 2/3.
+
+`--trial 0` or `--trial 1` plots one Zebra repeat instead of the pooled maps (the `trial_<i>` maps and nulls from `--per-trial` runs); those figures are named `data_release__zebra-trial-<i>__*.png`. The local Gabor maps stay pooled.
+
+A figure whose inputs are missing or do not fit together is skipped and listed at the end of the run.
